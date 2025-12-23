@@ -129,7 +129,17 @@ if __name__ == "__main__":
     )
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
+        geometry_path=args.dataset_geometry_path,           # 2025_12/22_17:22 [Tong Liu ADD] Geometry Directory
         metadata_path=args.dataset_metadata_path,
+        ######## Tong Liu ADD for depth procession ########
+        height=args.height,
+        width=args.width,
+        height_division_factor=16,
+        width_division_factor=16,
+        num_frames=args.num_frames,
+        time_division_factor=4,
+        time_division_remainder=1,
+        ######### Tong Liu ADD for depth procession ########
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
         main_data_operator=UnifiedDataset.default_video_operator(

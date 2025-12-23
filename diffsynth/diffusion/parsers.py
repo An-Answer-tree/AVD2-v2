@@ -3,6 +3,8 @@ import argparse
 
 def add_dataset_base_config(parser: argparse.ArgumentParser):
     parser.add_argument("--dataset_base_path", type=str, default="", required=True, help="Base path of the dataset.")
+    # 2025_12/22_17:22 [Tong Liu ADD] Geometry Directory
+    parser.add_argument("--dataset_geometry_path", type=str, default="", required=True, help="Geometry path of the dataset.")
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
     parser.add_argument("--dataset_repeat", type=int, default=1, help="Number of times to repeat the dataset per epoch.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")

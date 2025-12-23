@@ -25,6 +25,7 @@ dependencies = [
     "accelerate",
     "peft",
     "datasets",
+    "opencv-python",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
