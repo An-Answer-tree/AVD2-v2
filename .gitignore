@@ -13,6 +13,9 @@
 *.mv
 log*.txt
 
+# Data created during training
+diffsynth/core/data/o
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

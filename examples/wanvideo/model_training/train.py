@@ -1,5 +1,5 @@
 import torch, os, argparse, accelerate, warnings
-from diffsynth.core import UnifiedDataset
+from diffsynth.core.data.unified_dataset_with_ttc import UnifiedDatasetWithTTC
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
@@ -34,7 +34,14 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, fp8_models=fp8_models, offload_models=offload_models, device=device)
         tokenizer_config = ModelConfig(model_id="Wan-AI/Wan2.1-T2V-1.3B", origin_file_pattern="google/umt5-xxl/") if tokenizer_path is None else ModelConfig(tokenizer_path)
         audio_processor_config = ModelConfig(model_id="Wan-AI/Wan2.2-S2V-14B", origin_file_pattern="wav2vec2-large-xlsr-53-english/") if audio_processor_path is None else ModelConfig(audio_processor_path)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            audio_processor_config=audio_processor_config,
+        )
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
         
         # Training mode
@@ -81,6 +88,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             # Assume you are using this pipeline for inference,
             # please fill in the input parameters.
             "input_video": data["video"],
+            "ground_truth_depth": data["depth"],
             "height": data["video"][0].size[1],
             "width": data["video"][0].size[0],
             "num_frames": len(data["video"]),
@@ -100,12 +108,19 @@ class WanTrainingModule(DiffusionTrainingModule):
         return inputs_shared, inputs_posi, inputs_nega
     
     def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.get_pipeline_inputs(data)
+        if inputs is None:
+            inputs = self.get_pipeline_inputs(data)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
         return loss
+    
+
+class DualHeadWanTrainingModule(WanTrainingModule):
+    def __init__(self, *args, depth_loss_weight=1.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.depth_loss_weight = depth_loss_weight
 
 
 def wan_parser():
@@ -114,6 +129,7 @@ def wan_parser():
     parser = add_video_size_config(parser)
     parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to tokenizer.")
     parser.add_argument("--audio_processor_path", type=str, default=None, help="Path to the audio processor. If provided, the processor will be used for Wan2.2-S2V model.")
+    parser.add_argument("--ttc_json_path", type=str, default=None, help="Path to TTC json file.")
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Whether to initialize models on CPU.")
@@ -127,7 +143,9 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         kwargs_handlers=[accelerate.DistributedDataParallelKwargs(find_unused_parameters=args.find_unused_parameters)],
     )
-    dataset = UnifiedDataset(
+
+    dataset = UnifiedDatasetWithTTC(
+        ttc_json_path=args.ttc_json_path,
         base_path=args.dataset_base_path,
         geometry_path=args.dataset_geometry_path,           # 2025_12/22_17:22 [Tong Liu ADD] Geometry Directory
         metadata_path=args.dataset_metadata_path,
@@ -142,7 +160,7 @@ if __name__ == "__main__":
         ######### Tong Liu ADD for depth procession ########
         repeat=args.dataset_repeat,
         data_file_keys=args.data_file_keys.split(","),
-        main_data_operator=UnifiedDataset.default_video_operator(
+        main_data_operator=UnifiedDatasetWithTTC.default_video_operator(
             base_path=args.dataset_base_path,
             max_pixels=args.max_pixels,
             height=args.height,
@@ -158,6 +176,7 @@ if __name__ == "__main__":
             "input_audio": ToAbsolutePath(args.dataset_base_path) >> LoadAudio(sr=16000),
         }
     )
+
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
@@ -180,10 +199,12 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
+
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
     )
+
     launcher_map = {
         "sft:data_process": launch_data_process_task,
         "direct_distill:data_process": launch_data_process_task,

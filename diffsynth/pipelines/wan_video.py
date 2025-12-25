@@ -1,3 +1,4 @@
+#edited by cheng li
 import torch, types
 import numpy as np
 from PIL import Image
@@ -26,6 +27,7 @@ from ..models.wan_video_animate_adapter import WanAnimateAdapter
 from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
+from ..models.wan_video_ttc_controller import WanTTCTokenizer
 
 
 class WanVideoPipeline(BasePipeline):
@@ -55,6 +57,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_ShapeChecker(),
             WanVideoUnit_NoiseInitializer(),
             WanVideoUnit_PromptEmbedder(),
+            WanVideoUnit_TTC(),
             WanVideoUnit_S2V(),
             WanVideoUnit_InputVideoEmbedder(),
             WanVideoUnit_ImageEmbedderVAE(),
@@ -148,6 +151,11 @@ class WanVideoPipeline(BasePipeline):
         pipe.audio_encoder = model_pool.fetch_model("wans2v_audio_encoder")
         pipe.animate_adapter = model_pool.fetch_model("wan_video_animate_adapter")
 
+        if pipe.dit is not None and not hasattr(pipe.dit, "ttc_embedder") and hasattr(pipe.dit, "dim"):
+            pipe.dit.ttc_embedder = WanTTCTokenizer(out_dim=pipe.dit.dim).to(device=pipe.device, dtype=pipe.torch_dtype)
+        if pipe.dit2 is not None and not hasattr(pipe.dit2, "ttc_embedder") and hasattr(pipe.dit2, "dim"):
+            pipe.dit2.ttc_embedder = WanTTCTokenizer(out_dim=pipe.dit2.dim).to(device=pipe.device, dtype=pipe.torch_dtype)
+
         # Size division factor
         if pipe.vae is not None:
             pipe.height_division_factor = pipe.vae.upsampling_factor * 2
@@ -227,6 +235,7 @@ class WanVideoPipeline(BasePipeline):
         sigma_shift: Optional[float] = 5.0,
         # Speed control
         motion_bucket_id: Optional[int] = None,
+        ttc: Optional[Union[torch.Tensor, list, np.ndarray]] = None,
         # LongCat-Video
         longcat_video: Optional[list[Image.Image]] = None,
         # VAE tiling
@@ -269,6 +278,7 @@ class WanVideoPipeline(BasePipeline):
             "cfg_scale": cfg_scale, "cfg_merge": cfg_merge,
             "sigma_shift": sigma_shift,
             "motion_bucket_id": motion_bucket_id,
+            "ttc": ttc,
             "longcat_video": longcat_video,
             "tiled": tiled, "tile_size": tile_size, "tile_stride": tile_stride,
             "sliding_window_size": sliding_window_size, "sliding_window_stride": sliding_window_stride,
@@ -415,6 +425,46 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
         pipe.load_models_to_device(self.onload_model_names)
         prompt_emb = self.encode_prompt(pipe, prompt)
         return {"context": prompt_emb}
+
+
+class WanVideoUnit_TTC(PipelineUnit):
+    def __init__(self):
+        super().__init__(take_over=True)
+
+    def process(self, pipe: WanVideoPipeline, inputs_shared, inputs_posi, inputs_nega):
+        ttc = inputs_shared.pop("ttc", None)
+
+        if ttc is None:
+            inputs_posi.pop("ttc", None)
+            inputs_nega.pop("ttc", None)
+            return inputs_shared, inputs_posi, inputs_nega
+
+        if not isinstance(ttc, torch.Tensor):
+            try:
+                ttc = torch.as_tensor(ttc)
+            except Exception as e:
+                raise TypeError(f"ttc must be convertible to torch.Tensor, got type={type(ttc)}") from e
+
+        if ttc.ndim == 0:
+            ttc = ttc.view(1, 1)
+        elif ttc.ndim == 1:
+            ttc = ttc.unsqueeze(0)
+        elif ttc.ndim != 2:
+            raise ValueError(f"ttc must be 1D/2D tensor, got shape={tuple(ttc.shape)}")
+
+        inputs_posi["ttc"] = ttc
+
+        if inputs_shared.get("cfg_merge", False):
+            inputs_nega["ttc"] = torch.zeros_like(ttc)
+        else:
+            inputs_nega.pop("ttc", None)
+
+        return inputs_shared, inputs_posi, inputs_nega
+
+
+
+
+
 
 
 
@@ -785,7 +835,7 @@ class WanVideoUnit_TeaCache(PipelineUnit):
 class WanVideoUnit_CfgMerger(PipelineUnit):
     def __init__(self):
         super().__init__(take_over=True)
-        self.concat_tensor_names = ["context", "clip_feature", "y", "reference_latents"]
+        self.concat_tensor_names = ["context", "clip_feature", "y", "reference_latents", "ttc"]
 
     def process(self, pipe: WanVideoPipeline, inputs_shared, inputs_posi, inputs_nega):
         if not inputs_shared["cfg_merge"]:
@@ -1131,6 +1181,7 @@ def model_fn_wan_video(
     clip_feature: Optional[torch.Tensor] = None,
     y: Optional[torch.Tensor] = None,
     reference_latents = None,
+    ttc: Optional[torch.Tensor] = None,
     vace_context = None,
     vace_scale = 1.0,
     audio_embeds: Optional[torch.Tensor] = None,
@@ -1166,6 +1217,7 @@ def model_fn_wan_video(
             clip_feature=clip_feature,
             y=y,
             reference_latents=reference_latents,
+            ttc=ttc,
             vace_context=vace_context,
             vace_scale=vace_scale,
             tea_cache=tea_cache,
@@ -1199,6 +1251,7 @@ def model_fn_wan_video(
             latents=latents,
             timestep=timestep,
             context=context,
+            ttc=ttc,
             audio_embeds=audio_embeds,
             motion_latents=motion_latents,
             s2v_pose_latents=s2v_pose_latents,
@@ -1234,6 +1287,28 @@ def model_fn_wan_video(
     if motion_bucket_id is not None and motion_controller is not None:
         t_mod = t_mod + motion_controller(motion_bucket_id).unflatten(1, (6, dit.dim))
     context = dit.text_embedding(context)
+
+    if ttc is not None and hasattr(dit, "ttc_embedder") and dit.ttc_embedder is not None:
+        num_frames_for_ttc = kwargs.get("num_frames", None)
+        if isinstance(num_frames_for_ttc, torch.Tensor):
+            num_frames_for_ttc = int(num_frames_for_ttc.item())
+        ttc_tokens = dit.ttc_embedder(
+            ttc,
+            num_frames=num_frames_for_ttc,
+            downsample_factor=int(kwargs.get("ttc_downsample_factor", 4)),
+        )
+        if "ttc_scale" in kwargs and kwargs["ttc_scale"] is not None:
+            ttc_scale = kwargs["ttc_scale"]
+            if not torch.is_tensor(ttc_scale):
+                ttc_scale = torch.tensor(ttc_scale, device=ttc_tokens.device, dtype=ttc_tokens.dtype)
+            ttc_scale = ttc_scale.to(device=ttc_tokens.device, dtype=ttc_tokens.dtype)
+            if ttc_scale.ndim == 0:
+                ttc_tokens = ttc_tokens * ttc_scale
+            elif ttc_scale.ndim == 1:
+                ttc_tokens = ttc_tokens * ttc_scale.view(-1, 1, 1)
+            else:
+                ttc_tokens = ttc_tokens * ttc_scale
+        context = torch.cat([context, ttc_tokens], dim=1)
 
     x = latents
     # Merged cfg
@@ -1426,10 +1501,12 @@ def model_fn_wans2v(
     audio_embeds,
     motion_latents,
     s2v_pose_latents,
+    ttc: Optional[torch.Tensor] = None,
     drop_motion_frames=True,
     use_gradient_checkpointing_offload=False,
     use_gradient_checkpointing=False,
     use_unified_sequence_parallel=False,
+    **kwargs,
 ):
     if use_unified_sequence_parallel:
         import torch.distributed as dist
@@ -1441,6 +1518,17 @@ def model_fn_wans2v(
 
     # context embedding
     context = dit.text_embedding(context)
+
+    if ttc is not None and hasattr(dit, "ttc_embedder") and dit.ttc_embedder is not None:
+        num_frames_for_ttc = kwargs.get("num_frames", None)
+        if isinstance(num_frames_for_ttc, torch.Tensor):
+            num_frames_for_ttc = int(num_frames_for_ttc.item())
+        ttc_downsample_factor = kwargs.get("ttc_downsample_factor", 4)
+        ttc_tokens = dit.ttc_embedder(ttc, num_frames=num_frames_for_ttc, downsample_factor=ttc_downsample_factor)
+        ttc_scale = kwargs.get("ttc_scale", 1.0)
+        if isinstance(ttc_scale, (int, float)):
+            ttc_tokens = ttc_tokens * float(ttc_scale)
+        context = torch.cat([context, ttc_tokens], dim=1)
 
     # audio encode
     audio_emb_global, merged_audio_emb = dit.cal_audio_emb(audio_embeds)

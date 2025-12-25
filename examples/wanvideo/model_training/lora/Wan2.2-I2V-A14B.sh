@@ -1,5 +1,7 @@
+# 2025_12/24_23:26 [Tong Liu ADD] Geometry Directory
 accelerate launch examples/wanvideo/model_training/train.py \
   --dataset_base_path data/example_video_dataset \
+  --dataset_geometry_path /baai-cwm-backup/cwm/tong.liu/Geo_Out_Fine \
   --dataset_metadata_path data/example_video_dataset/metadata.csv \
   --height 480 \
   --width 832 \
