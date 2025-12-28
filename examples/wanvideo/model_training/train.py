@@ -65,6 +65,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
+            "dual_head_sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadLoss(pipe, **inputs_shared, **inputs_posi)
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary

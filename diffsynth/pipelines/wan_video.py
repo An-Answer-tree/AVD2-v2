@@ -28,6 +28,7 @@ from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 from ..models.wan_video_ttc_controller import WanTTCTokenizer
+from ..models.wan_video_depth_head import WanDepthHead
 
 
 class WanVideoPipeline(BasePipeline):
@@ -60,6 +61,7 @@ class WanVideoPipeline(BasePipeline):
             WanVideoUnit_TTC(),
             WanVideoUnit_S2V(),
             WanVideoUnit_InputVideoEmbedder(),
+            WanVideoUnit_InputDepthEmbedder(),
             WanVideoUnit_ImageEmbedderVAE(),
             WanVideoUnit_ImageEmbedderCLIP(),
             WanVideoUnit_ImageEmbedderFused(),
@@ -155,6 +157,11 @@ class WanVideoPipeline(BasePipeline):
             pipe.dit.ttc_embedder = WanTTCTokenizer(out_dim=pipe.dit.dim).to(device=pipe.device, dtype=pipe.torch_dtype)
         if pipe.dit2 is not None and not hasattr(pipe.dit2, "ttc_embedder") and hasattr(pipe.dit2, "dim"):
             pipe.dit2.ttc_embedder = WanTTCTokenizer(out_dim=pipe.dit2.dim).to(device=pipe.device, dtype=pipe.torch_dtype)
+
+        if pipe.dit is not None and not hasattr(pipe.dit, "depth_head") and hasattr(pipe.dit, "dim"):
+            pipe.dit.depth_head = WanDepthHead(in_dim=pipe.dit.dim, out_dim=).to(device=pipe.device, dtype=pipe.torch_dtype)
+        if pipe.dit2 is not None and not hasattr(pipe.dit2, "depth_head") and hasattr(pipe.dit2, "dim"):
+            pipe.dit2.depth_head = WanDepthHead(in_dim=pipe.dit2.dim, out_dim=).to(device=pipe.device, dtype=pipe.torch_dtype)
 
         # Size division factor
         if pipe.vae is not None:
@@ -398,6 +405,91 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
         else:
             latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
             return {"latents": latents}
+        
+
+
+class WanVideoUnit_InputDepthEmbedder(PipelineUnit):
+    """Encodes ground truth depth data into latents using the VAE.
+
+    This unit processes the raw depth tensor provided by the dataset,
+    adapts it for the VAE (replicating channels if necessary), and
+    computes the latent representation required for depth supervision
+    or training the depth head.
+
+    Attributes:
+        input_params: Parameters required from the input dictionary.
+        output_params: Parameters added to the input dictionary after processing.
+        onload_model_names: Models required to be loaded on VRAM (VAE).
+    """
+
+    def __init__(self):
+        super().__init__(
+            input_params=(
+                "ground_truth_depth",
+                "tiled",
+                "tile_size",
+                "tile_stride"
+            ),
+            output_params=("input_depth_latents",),
+            onload_model_names=("vae",)
+        )
+
+    def process(
+        self,
+        pipe: WanVideoPipeline,
+        ground_truth_depth: torch.Tensor,
+        tiled: bool = False,
+        tile_size: int = None,
+        tile_stride: int = None
+    ) -> dict[str, torch.Tensor]:
+        """Encodes the depth tensor into latents.
+
+        Args:
+            pipe: The main WanVideoPipeline instance.
+            ground_truth_depth: A tensor of shape (C, F, H, W) containing
+                normalized depth values [-1, 1].
+            tiled: Whether to use tiled VAE encoding to save VRAM.
+            tile_size: The size of tiles for VAE encoding.
+            tile_stride: The stride of tiles for VAE encoding.
+
+        Returns:
+            A dictionary containing the encoded depth latents.
+            Key: "input_depth_latents"
+            Value: Tensor of shape (B, C_latent, F_latent, H_latent, W_latent).
+        """
+        if ground_truth_depth is None:
+            return {}
+
+        # 1. VRAM Management: Ensure VAE is on the GPU.
+        pipe.load_models_to_device(self.onload_model_names)
+
+        # 2. Data Preparation:
+        # Move to the correct device and dtype.
+        # Dataset returns shape: (C, F, H, W) typically (1, F, H, W).
+        depth = ground_truth_depth.to(device=pipe.device, dtype=pipe.torch_dtype)
+
+        # 3. Channel Adaptation:
+        # The Wan VAE is trained on RGB images and expects 3 channels.
+        # Depth maps are 1-channel. We replicate the channel 3 times.
+        if depth.shape[0] == 1:
+            depth = depth.repeat(3, 1, 1, 1)
+
+        # 4. Batch Dimension:
+        # VAE.encode expects (B, C, F, H, W). Add batch dimension B=1.
+        depth = depth.unsqueeze(0)
+
+        # 5. VAE Encoding:
+        # Compress the 3-channel depth video into latents.
+        # Output shape: (1, 16, F/4, H/16, W/16)
+        input_depth_latents = pipe.vae.encode(
+            depth,
+            device=pipe.device,
+            tiled=tiled,
+            tile_size=tile_size,
+            tile_stride=tile_stride
+        ).to(dtype=pipe.torch_dtype, device=pipe.device)
+
+        return {"input_depth_latents": input_depth_latents}
 
 
 
@@ -460,11 +552,6 @@ class WanVideoUnit_TTC(PipelineUnit):
             inputs_nega.pop("ttc", None)
 
         return inputs_shared, inputs_posi, inputs_nega
-
-
-
-
-
 
 
 
@@ -1449,18 +1536,65 @@ def model_fn_wan_video(
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
         if tea_cache is not None:
             tea_cache.store(x)
-            
-    x = dit.head(x, t)
+         
+    # 1. Video Head Projection
+    # Projects hidden states to video latents (noise or velocity).
+    # Shape: (Batch, Seq_Len, Out_Dim)
+    x_video = dit.head(x, t)
+
+    # 2. Depth Head Projection (Optional)
+    # Checks if a depth head is attached to the DiT model (via monkey patching).
+    # If present, projects hidden states to depth latents.
+    x_depth = None
+    if hasattr(dit, "depth_head") and dit.depth_head is not None:
+        # Note: The depth head accepts 't' for API compatibility, 
+        # even if it might not use it internally.
+        x_depth = dit.depth_head(x, t)
+
+    # 3. Unified Sequence Parallel (USP) Gathering
+    # If sequence parallelism is enabled, gather partial results from all GPUs.
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
-            x = get_sp_group().all_gather(x, dim=1)
-            x = x[:, :-pad_shape] if pad_shape > 0 else x
-    # Remove reference latents
+            # Gather video latents.
+            x_video = get_sp_group().all_gather(x_video, dim=1)
+            x_video = x_video[:, :-pad_shape] if pad_shape > 0 else x_video
+            
+            # Gather depth latents if they exist.
+            if x_depth is not None:
+                x_depth = get_sp_group().all_gather(x_depth, dim=1)
+                x_depth = x_depth[:, :-pad_shape] if pad_shape > 0 else x_depth
+
+    # 4. Remove Reference Latents (Image-to-Video only)
+    # The input sequence includes reference frames which should not be part 
+    # of the prediction output. We slice them off here.
     if reference_latents is not None:
-        x = x[:, reference_latents.shape[1]:]
+        # Determine the length of the reference sequence.
+        # reference_latents shape is typically (Batch, Length, Channels).
+        ref_len = reference_latents.shape[1]
+        
+        # Slice the video output.
+        x_video = x_video[:, ref_len:]
+        
+        # Slice the depth output.
+        if x_depth is not None:
+            x_depth = x_depth[:, ref_len:]
+            
+        # Decrement the frame count 'f' to account for the removed reference frame.
+        # This ensures 'unpatchify' uses the correct grid size.
         f -= 1
-    x = dit.unpatchify(x, (f, h, w))
-    return x
+
+    # 5. Unpatchify (Reshape)
+    # Reconstruct the 5D tensor from the flattened sequence.
+    # Transformation: (B, L, C) -> (B, C, F, H, W)
+    x_video = dit.unpatchify(x_video, (f, h, w))
+
+    if x_depth is not None:
+        x_depth = dit.unpatchify(x_depth, (f, h, w))
+        # Return a dictionary for the DualHeadTrainingModule to handle.
+        return {"video": x_video, "depth": x_depth}
+
+    # Default return for standard inference or single-head training.
+    return x_video
 
 
 def model_fn_longcat_video(

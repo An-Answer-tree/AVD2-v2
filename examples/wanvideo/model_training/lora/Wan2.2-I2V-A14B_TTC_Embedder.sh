@@ -27,7 +27,7 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --model_id_with_origin_paths "Wan-AI/Wan2.2-I2V-A14B:high_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-I2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-I2V-A14B:Wan2.1_VAE.pth" \
   --preset_lora_path "${HIGH_LORA}" \
   --preset_lora_model "dit" \
-  --trainable_models "dit.ttc_embedder" \
+  --trainable_models "dit.ttc_embedder,dit.depth_head" \
   --learning_rate 1e-4 \
   --num_epochs 5 \
   --output_path "${OUT_HIGH}" \
@@ -36,7 +36,8 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --use_gradient_checkpointing \
   --use_gradient_checkpointing_offload \
   --max_timestep_boundary 0.358 \
-  --min_timestep_boundary 0
+  --min_timestep_boundary 0 \
+  --task "dual_head_sft"
 
 accelerate launch examples/wanvideo/model_training/train.py \
   --dataset_base_path "${DATASET_BASE_PATH}" \
@@ -51,7 +52,7 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --model_id_with_origin_paths "Wan-AI/Wan2.2-I2V-A14B:low_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-I2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-I2V-A14B:Wan2.1_VAE.pth" \
   --preset_lora_path "${LOW_LORA}" \
   --preset_lora_model "dit" \
-  --trainable_models "dit.ttc_embedder" \
+  --trainable_models "dit.ttc_embedder,dit.depth_head" \
   --learning_rate 1e-4 \
   --num_epochs 5 \
   --output_path "${OUT_LOW}" \
@@ -60,4 +61,5 @@ accelerate launch examples/wanvideo/model_training/train.py \
   --use_gradient_checkpointing \
   --use_gradient_checkpointing_offload \
   --max_timestep_boundary 1 \
-  --min_timestep_boundary 0.358
+  --min_timestep_boundary 0.358 \
+  --task "dual_head_sft"

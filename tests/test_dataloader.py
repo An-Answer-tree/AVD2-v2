@@ -1,146 +1,146 @@
 import torch
-import os
-import sys
 from torch.utils.data import DataLoader
-from PIL import Image
+from torchvision import transforms
+import sys
+import os
 
-# 尝试引入 diffsynth 库
+# --- Imports ---
 try:
-    from diffsynth.core import UnifiedDataset
-    from diffsynth.core.data.operators import LoadVideo, LoadAudio, ToAbsolutePath
+    from diffsynth.core.data.unified_dataset_with_ttc import UnifiedDatasetWithTTC, UnifiedDataset
 except ImportError:
-    print("❌ 错误: 找不到 diffsynth 库，请确保环境变量设置正确。")
-    exit()
+    # 这里的 import 路径请根据实际情况调整
+    print("Error: Could not import dataset classes. Make sure PYTHONPATH is correct.")
+    sys.exit(1)
 
-# ==========================================
-# 1. 配置区域 (基于你的真实环境)
-# ==========================================
-class MockArgs:
-    def __init__(self):
-        # [真实路径]
-        self.dataset_base_path = "/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/full_demos"
-        self.dataset_geometry_path = "/baai-cwm-backup/cwm/tong.liu/Geo_Out"
-        self.dataset_metadata_path = "/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/metadata.csv"
+# --- Configuration ---
+DATASET_BASE_PATH = "/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/full_demos"
+GEOMETRY_PATH = "/baai-cwm-backup/cwm/tong.liu/Geo_Out_Fine"
+METADATA_CSV = "/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/video1.csv"
+TTC_JSON = "/baai-cwm-vepfs/cwm/cheng.li/qwen3vl_workspace/calculate_ttc_logs/ttc_results_20251222_113546.json"
+
+HEIGHT = 480
+WIDTH = 832 
+NUM_FRAMES = 49 
+BATCH_SIZE = 1  # 强制为 1，配合 lambda x: x[0]
+
+# --- Helper: Convert List[PIL] -> Tensor (C, F, H, W) ---
+def process_video_output(video_frames):
+    """
+    Takes the output of LoadVideo (List of PIL Images) and converts 
+    it to a normalized PyTorch tensor [C, F, H, W] in range [-1, 1].
+    """
+    if not isinstance(video_frames, list):
+        return video_frames 
+    
+    tf = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    
+    # Apply to all frames and stack
+    tensors = [tf(frame) for frame in video_frames]
+    if len(tensors) == 0:
+        return torch.zeros(3, NUM_FRAMES, HEIGHT, WIDTH)
         
-        # [视频参数]
-        self.height = 480
-        self.width = 832
-        self.num_frames = 49
-        
-        # Resize 参数 (通常保持默认或根据显存调整)
-        self.max_pixels = 512 * 512 
-        
-        # 数据集参数
-        self.dataset_repeat = 1
-        self.data_file_keys = "video" 
+    video_tensor = torch.stack(tensors) # (F, C, H, W)
+    video_tensor = video_tensor.permute(1, 0, 2, 3) # -> (C, F, H, W)
+    
+    return video_tensor
 
-args = MockArgs()
+def test_dataloader():
+    print(f"--- Starting Dataloader Test ---")
 
-# ==========================================
-# 2. 主测试逻辑
-# ==========================================
-def test_dataloader_final():
-    print(f"🚀 开始测试 DataLoader (Metadata 模式)...")
-    print(f"📂 Video Path: {args.dataset_base_path}")
-    print(f"📂 Geo Path:   {args.dataset_geometry_path}")
-    print(f"📄 Metadata:   {args.dataset_metadata_path}")
+    # 1. Define Base Operator
+    base_video_op = UnifiedDataset.default_video_operator(
+        base_path=DATASET_BASE_PATH,
+        height=HEIGHT,
+        width=WIDTH,
+        num_frames=NUM_FRAMES,
+        time_division_factor=4, 
+        time_division_remainder=1, 
+    )
 
-    # 1. 初始化 UnifiedDataset
-    # 这次我们会传入 metadata_path，让它自己去读 CSV
+    # 2. Define Final Operator
+    final_video_op = lambda x: process_video_output(base_video_op(x))
+
+    # 3. Initialize Dataset
     try:
-        dataset = UnifiedDataset(
-            base_path=args.dataset_base_path,
-            geometry_path=args.dataset_geometry_path, # [你的 Depth 代码生效处]
-            metadata_path=args.dataset_metadata_path, # [读取 CSV]
-            
-            # 尺寸参数
-            height=args.height,
-            width=args.width,
-            num_frames=args.num_frames,
-            
-            repeat=args.dataset_repeat,
-            data_file_keys=args.data_file_keys.split(","),
-            
-            # 视频加载算子 (只做 Resize, 不转 Tensor)
-            main_data_operator=UnifiedDataset.default_video_operator(
-                base_path=args.dataset_base_path,
-                max_pixels=args.max_pixels,
-                height=args.height,
-                width=args.width,
-                num_frames=args.num_frames,
-            ),
+        dataset = UnifiedDatasetWithTTC(
+            ttc_json_path=TTC_JSON,
+            base_path=DATASET_BASE_PATH,
+            geometry_path=GEOMETRY_PATH,
+            metadata_path=METADATA_CSV,
+            height=HEIGHT,
+            width=WIDTH,
+            num_frames=NUM_FRAMES,
+            data_file_keys=("video",),
+            main_data_operator=final_video_op,
+            filter_missing_ttc=True,
+            filter_first_ttc_zero=False,
         )
-        print(f"✅ Dataset 初始化成功，总数据量: {len(dataset)}")
-        
     except Exception as e:
-        print(f"❌ Dataset 初始化失败: {e}")
-        # 常见错误提示
-        if "No such file" in str(e):
-            print("   -> 请检查 metadata.csv 文件路径是否正确。")
+        print(f"\n[Fatal Error] Failed to initialize dataset: {e}")
         return
 
-    # 2. 初始化 DataLoader
-    # 【关键】collate_fn=lambda x: x[0]
-    # 意味着 DataLoader 取出一个样本后，直接把该样本(dict)传出来，不进行任何 Tensor 打包
-    dataloader = DataLoader(
+    print(f"Dataset initialized. Total samples: {len(dataset)}")
+
+    # 4. Initialize DataLoader
+    # 使用你指定的 lambda collate_fn，直接提取单个样本，不进行 Stack
+    loader = DataLoader(
         dataset, 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=0, 
+        batch_size=BATCH_SIZE, # 必须为 1
+        shuffle=True, 
+        num_workers=4,
         collate_fn=lambda x: x[0] 
     )
 
-    print("\n🔄 开始读取前 2 个样本...")
-    
+    # 5. Iterate and Inspect
     try:
-        for i, batch in enumerate(dataloader):
-            if i >= 2: break
-            
-            print(f"\n--- Sample {i} ---")
-            # 此时 batch 就是一个普通的 python dict
-            
-            # 检查 Video (预期: List of PIL)
-            if "video" in batch:
-                video_data = batch["video"]
-                print(f"  🎬 Key: 'video'")
-                print(f"     Type: {type(video_data)}") # <class 'list'>
-                
-                if isinstance(video_data, list) and len(video_data) > 0:
-                    first_frame = video_data[0]
-                    print(f"     Content: List of {type(first_frame)}") # <class 'PIL.Image.Image'>
-                    print(f"     Length: {len(video_data)} frames")
-                    # PIL size 是 (Width, Height)
-                    print(f"     Size: {first_frame.size} (Expected: ({args.width}, {args.height}))")
-            
-            # 检查 Depth (预期: Tensor)
-            if "depth" in batch:
-                depth_data = batch["depth"]
-                print(f"  🧊 Key: 'depth'")
-                print(f"     Type: {type(depth_data)}") # <class 'torch.Tensor'>
-                
-                if isinstance(depth_data, torch.Tensor):
-                    print(f"     Shape: {depth_data.shape}") 
-                    # 预期: [1, 1, 49, 480, 832] (如果你的代码带batch dim) 
-                    # 或者 [1, 49, 480, 832] (如果你的代码不带batch dim)
-                    
-                    print(f"     Range: min={depth_data.min():.2f}, max={depth_data.max():.2f}")
-                    
-                    # 简单验证一下数值是否合理
-                    if depth_data.max() > 1.1 or depth_data.min() < -1.1:
-                        print("     ⚠️ 警告: Depth 数值范围似乎没有归一化到 [-1, 1]")
-                    else:
-                        print("     ✅ 数值范围正常 (Normalized)")
+        print("\n--- Fetching first sample (Batch Size=1) ---\n")
+        for i, sample in enumerate(loader):
+            # 注意：sample 是字典，不是 Batch 后的 Tensor
+            # 形状应该是 [C, F, H, W] 而不是 [B, C, F, H, W]
 
-            # 检查 Prompt
-            if "prompt" in batch:
-                print(f"  📝 Key: 'prompt' | Content: {str(batch['prompt'])[:50]}...")
+            # Inspect Video
+            if "video" in sample:
+                video = sample["video"]
+                print(f"Video Shape: {video.shape} | Type: {video.dtype}")
+                # 期望: (3, 49, 480, 832)
+                
+            # Inspect Depth
+            if "depth" in sample:
+                depth = sample["depth"]
+                print(f"Depth Shape: {depth.shape} | Type: {depth.dtype}")
+                # 期望: (1, 49, 480, 832)
+
+                # Verify Alignment (比较 F, H, W)
+                # Video: (C, F, H, W) -> shape[1]=F, shape[2]=H, shape[3]=W
+                if "video" in sample:
+                    # 检查 F (帧数)
+                    if video.shape[1] != depth.shape[1]:
+                        print(f"[FAIL] Frame count mismatch! Video: {video.shape[1]} vs Depth: {depth.shape[1]}")
+                    else:
+                        print(f"[PASS] Frame count aligns: {video.shape[1]}")
+                    
+                    # 检查 H, W (空间尺寸)
+                    if video.shape[2:] != depth.shape[2:]:
+                        print(f"[FAIL] Spatial mismatch! Video: {video.shape[2:]} vs Depth: {depth.shape[2:]}")
+                    else:
+                        print(f"[PASS] Spatial dimensions align: {video.shape[2:]}")
+
+            # Inspect TTC
+            if "ttc" in sample:
+                ttc = sample["ttc"]
+                print(f"TTC Value (List): {ttc}")
+                print(f"TTC Length: {len(ttc)}")
+
+            print("\n--- Test Finished successfully ---")
+            break 
 
     except Exception as e:
+        print(f"\n[Error] Runtime error during iteration: {e}")
         import traceback
-        print("\n❌ 迭代过程报错:")
         traceback.print_exc()
 
-    print("\n✅ 测试结束。")
-
 if __name__ == "__main__":
-    test_dataloader_final()
+    test_dataloader()
