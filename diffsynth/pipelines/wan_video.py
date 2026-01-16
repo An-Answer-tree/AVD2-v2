@@ -159,9 +159,9 @@ class WanVideoPipeline(BasePipeline):
             pipe.dit2.ttc_embedder = WanTTCTokenizer(out_dim=pipe.dit2.dim).to(device=pipe.device, dtype=pipe.torch_dtype)
 
         if pipe.dit is not None and not hasattr(pipe.dit, "depth_head") and hasattr(pipe.dit, "dim"):
-            pipe.dit.depth_head = WanDepthHead(in_dim=pipe.dit.dim, out_dim=).to(device=pipe.device, dtype=pipe.torch_dtype)
+            pipe.dit.depth_head = WanDepthHead(in_dim=pipe.dit.dim, out_dim=64).to(device=pipe.device, dtype=pipe.torch_dtype)
         if pipe.dit2 is not None and not hasattr(pipe.dit2, "depth_head") and hasattr(pipe.dit2, "dim"):
-            pipe.dit2.depth_head = WanDepthHead(in_dim=pipe.dit2.dim, out_dim=).to(device=pipe.device, dtype=pipe.torch_dtype)
+            pipe.dit2.depth_head = WanDepthHead(in_dim=pipe.dit2.dim, out_dim=64).to(device=pipe.device, dtype=pipe.torch_dtype)
 
         # Size division factor
         if pipe.vae is not None:

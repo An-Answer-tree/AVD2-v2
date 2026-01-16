@@ -17,6 +17,8 @@ log*.txt
 diffsynth/core/data/o
 # test path
 tests/
+# model backup
+/models.bak.20260113_070704/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

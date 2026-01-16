@@ -213,5 +213,6 @@ if __name__ == "__main__":
         "sft:train": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
+        "dual_head_sft": launch_training_task,  #add dual_head_sft
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
