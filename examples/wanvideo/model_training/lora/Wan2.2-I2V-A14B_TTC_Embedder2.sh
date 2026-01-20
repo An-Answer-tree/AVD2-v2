@@ -30,29 +30,27 @@ if [[ -z "${NUM_GPUS:-}" ]]; then
   NUM_GPUS="${#_GPU_ARR[@]}"
 fi
 
-DATASET_BASE_PATH="/baai-cwm-backup/cwm/tong.liu/newfulldemo/"
-GEOMETRY_PATH="/baai-cwm-backup/cwm/tong.liu/geodepthnew/"
+DATASET_BASE_PATH="/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/full_demos"
+GEOMETRY_PATH="/baai-cwm-backup/cwm/tong.liu/Geo_Out_Fine"
 METADATA_CSV="/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/video1.csv"
-TTC_JSON="/baai-cwm-backup/cwm/tong.liu/ttcnew1.json"
+TTC_JSON="/baai-cwm-vepfs/cwm/cheng.li/qwen3vl_workspace/calculate_ttc_logs/ttc_results_20251222_113546.json"
 
 HIGH_LORA="/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/models/train/Wan2.2-I2V-A14B_high_noise_lora/epoch-4.safetensors"
 LOW_LORA="/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/models/train/Wan2.2-I2V-A14B_low_noise_lora/epoch-4.safetensors"
 
 OUT_ROOT="${OUT_ROOT:-/baai-cwm-backup/cwm/tong.liu/outputckpt}"
-OUT_HIGH="${OUT_ROOT}/Wan2.2-I2V-A14B_high_noise_ttc_49embedderfree"
-OUT_LOW="${OUT_ROOT}/Wan2.2-I2V-A14B_low_noise_ttc_49embedderfree"
+OUT_HIGH="${OUT_ROOT}/Wan2.2-I2V-A14B_high_noise_ttc_embedder145"
+OUT_LOW="${OUT_ROOT}/Wan2.2-I2V-A14B_low_noise_ttc_embedder145"
 
 HEIGHT="${HEIGHT:-320}"
 WIDTH="${WIDTH:-368}"
-NUM_FRAMES="${NUM_FRAMES:-49}"
+NUM_FRAMES="${NUM_FRAMES:-145}"
 DATASET_REPEAT="${DATASET_REPEAT:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
 
 TASK="${TASK:-dual_head_sft}"
 TRAINABLE_MODELS="${TRAINABLE_MODELS:-dit.ttc_embedder,dit.depth_head}"
-
-FREEZE_PRESET_LORA="${FREEZE_PRESET_LORA:-1}"
 
 if [[ -z "${REMOVE_PREFIX_IN_CKPT:-}" ]]; then
   if [[ "${TRAINABLE_MODELS}" == *","* ]]; then
@@ -115,10 +113,6 @@ COMMON_ARGS=(
   --task "${TASK}"
   --dataset_num_workers "${NUM_WORKERS}"
 )
-
-if [[ "${FREEZE_PRESET_LORA}" == "1" ]]; then
-  COMMON_ARGS+=(--freeze_preset_lora)
-fi
 
 accelerate launch \
   --num_processes "${NUM_GPUS}" \
