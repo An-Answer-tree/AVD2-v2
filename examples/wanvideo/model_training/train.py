@@ -164,6 +164,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "dual_head_sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadLoss(pipe, **inputs_shared, **inputs_posi),
+            "dual_head_sft_with_decay_factor": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadLossWithDecayFactor(pipe, **inputs_shared, **inputs_posi),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
@@ -447,5 +448,6 @@ if __name__ == "__main__":
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
         "dual_head_sft": launch_training_task,
+        "dual_head_sft_with_decay_factor": launch_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

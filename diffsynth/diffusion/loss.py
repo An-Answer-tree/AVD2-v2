@@ -126,6 +126,124 @@ def FlowMatchSFTDualHeadLoss(
 
     return total_loss   
 
+def FlowMatchSFTDualHeadLossWithDecayFactor(
+    pipe: BasePipeline,
+    depth_loss_weight: float = 1.0,
+    **inputs
+) -> torch.Tensor:
+    """Calculates the combined loss for the Dual-Head WanVideo model.
+
+    This function computes the Flow Matching loss for the video generation head
+    and the Mean Squared Error (MSE) loss for the depth prediction head.
+    It handles the separate outputs returned by the modified model_fn.
+
+    Args:
+        pipe: The training pipeline instance containing the model and scheduler.
+        depth_loss_weight: The weighting factor for the depth loss component.
+            Defaults to 1.0.
+        **inputs: A dictionary containing batch data, including 'input_latents',
+            'input_depth_latents', and configuration parameters.
+
+    Returns:
+        A scalar Tensor representing the weighted sum of video and depth losses.
+    """
+    # 1. Timestep Sampling
+    # Calculate boundaries for timestep sampling based on input config.
+    max_timestep_boundary = int(
+        inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps)
+    )
+    min_timestep_boundary = int(
+        inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps)
+    )
+
+    # Sample a random timestep index and convert to the correct device/dtype.
+    timestep_id = torch.randint(
+        min_timestep_boundary, max_timestep_boundary, (1,)
+    )
+    timestep = pipe.scheduler.timesteps[timestep_id].to(
+        dtype=pipe.torch_dtype, device=pipe.device
+    )
+
+    # 2. Video Target Preparation (Flow Matching)
+    # Generate noise and add it to the clean video latents.
+    noise = torch.randn_like(inputs["input_latents"])
+    inputs["latents"] = pipe.scheduler.add_noise(
+        inputs["input_latents"], noise, timestep
+    )
+    
+    # Calculate the velocity target (v) for the video head.
+    training_target = pipe.scheduler.training_target(
+        inputs["input_latents"], noise, timestep
+    )
+
+    # 3. Model Forward Pass
+    # Gather necessary sub-models.
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    
+    # Perform inference. This calls your modified model_fn_wan_video.
+    # Expected output: {"video": Tensor, "depth": Tensor} or Tensor
+    model_outputs = pipe.model_fn(**models, **inputs, timestep=timestep)
+
+    # 4. Output Parsing
+    # Handle both dictionary output (Dual Head) and tensor output (Legacy/Single Head).
+    if isinstance(model_outputs, dict):
+        noise_pred = model_outputs.get("video")
+        depth_pred = model_outputs.get("depth")
+    else:
+        noise_pred = model_outputs
+        depth_pred = None
+
+    # 5. Calculate Video Loss
+    # Standard MSE between predicted velocity and target velocity.
+    loss_video = torch.nn.functional.mse_loss(
+        noise_pred.float(), training_target.float()
+    )
+    loss_video = loss_video * pipe.scheduler.training_weight(timestep)
+
+    # 6. Calculate Depth Loss
+    loss_depth = torch.tensor(0.0, device=loss_video.device, dtype=loss_video.dtype)
+    
+    if depth_pred is not None:
+        target_depth = inputs.get("input_depth_latents")
+        
+        if target_depth is None:
+            raise ValueError(
+                "Depth prediction exists but 'input_depth_latents' is missing "
+                "from inputs. Check your Dataset and Unit configuration."
+            )
+
+        # Shape Alignment:
+        # If the model sliced off reference frames (I2V), depth_pred will have 
+        # fewer frames than the ground truth (target_depth).
+        # We must align the ground truth to match the prediction.
+        if depth_pred.shape[2] != target_depth.shape[2]:
+            diff = target_depth.shape[2] - depth_pred.shape[2]
+            # Slice the target to remove the initial reference frames.
+            target_depth = target_depth[:, :, diff:]
+
+        # Compute MSE Loss against Clean Ground Truth (Reconstruction).
+        loss_depth = torch.nn.functional.mse_loss(
+            depth_pred.float(), target_depth.float()
+        )
+
+    # 7. Aggregate Total Loss (adaptive loss weight)
+    # Apply quadratic decay to depth weight: w(t) = base_weight * (1 - t/T_max)^2.
+    # We use .max() to infer the maximum noise level (e.g. 1000) from the scheduler tensor.
+    t_max = pipe.scheduler.timesteps.max()
+    decay_factor = torch.clamp((1 - timestep.float() / t_max) ** 2, min=0.0)
+
+    total_loss = loss_video + (loss_depth * depth_loss_weight * decay_factor)
+
+    print(
+        f"[Loss Info] T={timestep.item():.0f} | "
+        f"VideoLoss: {loss_video.item():.5f} | "
+        f"DepthLoss: {loss_depth.item():.5f} | "
+        f"DecayFactor: {decay_factor.item():.4f} | "
+        f"TotalLoss: {total_loss.item():.5f}"
+    )
+
+    return total_loss
+
 
 def DirectDistillLoss(pipe: BasePipeline, **inputs):
     pipe.scheduler.set_timesteps(inputs["num_inference_steps"])
