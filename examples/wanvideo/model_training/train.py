@@ -4,6 +4,8 @@ import warnings
 import torch
 import accelerate
 
+from safetensors.torch import load_file as safetensors_load_file
+
 from diffsynth.core.data.unified_dataset_with_ttc import UnifiedDatasetWithTTC
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
@@ -30,6 +32,95 @@ def _parse_csv_list(value):
     s = str(value).strip()
     return [s] if s else []
 
+
+
+def _load_state_dict_any(path):
+    if path is None:
+        return None
+    p = str(path)
+    if p.endswith('.safetensors'):
+        return safetensors_load_file(p, device='cpu')
+    obj = torch.load(p, map_location='cpu')
+    if isinstance(obj, dict) and 'state_dict' in obj and isinstance(obj['state_dict'], dict):
+        return obj['state_dict']
+    return obj
+
+
+def _strip_prefix_from_state_dict(state_dict, prefixes):
+    if state_dict is None:
+        return None
+    if not prefixes:
+        return state_dict
+    out = {}
+    for k, v in state_dict.items():
+        new_k = k
+        for pref in prefixes:
+            if pref and new_k.startswith(pref):
+                new_k = new_k[len(pref):]
+                break
+        out[new_k] = v
+    return out
+
+
+def _infer_init_dit_ckpt_target(model_id_with_origin_paths, init_target, pipe):
+    if init_target is not None:
+        t = str(init_target).strip().lower()
+        if t and t != "auto":
+            return t
+
+    if getattr(pipe, "dit2", None) is None:
+        return "dit"
+
+    s = str(model_id_with_origin_paths or "").lower()
+    has_high = "high_noise_model" in s
+    has_low = "low_noise_model" in s
+
+    if has_high and not has_low:
+        return "dit"
+    if has_low and not has_high:
+        return "dit2"
+    return "both"
+
+
+def _load_init_dit_checkpoint(pipe, ckpt_path, target="both", prefixes=None, verbose=True):
+    if ckpt_path is None:
+        return
+    state_dict = _load_state_dict_any(ckpt_path)
+    if state_dict is None:
+        raise RuntimeError(f"Failed to load checkpoint: {ckpt_path}")
+    prefixes = prefixes or [
+        'pipe.dit.',
+        'module.pipe.dit.',
+        'dit.',
+        'module.dit.',
+        'pipe.',
+        'module.pipe.',
+        'module.',
+    ]
+    stripped = _strip_prefix_from_state_dict(state_dict, prefixes)
+
+    target = str(target or "both").lower()
+    if target not in ("dit", "dit2", "both"):
+        raise ValueError(
+            f"Invalid init_dit_ckpt target '{target}'. Expected one of: dit, dit2, both."
+        )
+
+    targets = []
+    if target in ("dit", "both"):
+        if getattr(pipe, "dit", None) is None:
+            raise RuntimeError("pipe.dit is not available, cannot load init_dit_ckpt into it.")
+        targets.append(("dit", pipe.dit))
+
+    if target in ("dit2", "both"):
+        if getattr(pipe, "dit2", None) is None:
+            raise RuntimeError("pipe.dit2 is not available, cannot load init_dit_ckpt into it.")
+        targets.append(("dit2", pipe.dit2))
+
+    for name, model in targets:
+        missing, unexpected = model.load_state_dict(stripped, strict=False)
+        if verbose:
+            print(f"Loaded init checkpoint into {name}: {ckpt_path}")
+            print(f"  missing_keys: {len(missing)}  unexpected_keys: {len(unexpected)}")
 
 def _resolve_attr_path(root, path):
     obj = root
@@ -93,6 +184,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         task="sft",
         max_timestep_boundary=1.0,
         min_timestep_boundary=0.0,
+        init_dit_ckpt=None,
+        init_dit_ckpt_prefixes=None,
+        init_dit_ckpt_target="auto",
+        depth_loss_weight=1.0,
+        depth_latent_scale=1.0,
     ):
         super().__init__()
 
@@ -144,6 +240,18 @@ class WanTrainingModule(DiffusionTrainingModule):
             task=task,
         )
 
+        if init_dit_ckpt is not None:
+            target = _infer_init_dit_ckpt_target(
+                model_id_with_origin_paths, init_dit_ckpt_target, self.pipe
+            )
+            _load_init_dit_checkpoint(
+                self.pipe,
+                init_dit_ckpt,
+                target=target,
+                prefixes=init_dit_ckpt_prefixes,
+                verbose=(os.getenv("RANK", "0") == "0"),
+            )
+
         self._enforce_trainability(
             trainable_models=trainable_models,
             preset_lora_path=preset_lora_path,
@@ -165,9 +273,13 @@ class WanTrainingModule(DiffusionTrainingModule):
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "dual_head_sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadLoss(pipe, **inputs_shared, **inputs_posi),
             "dual_head_sft_with_decay_factor": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadLossWithDecayFactor(pipe, **inputs_shared, **inputs_posi),
+            "dual_head_joint_sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadJointLoss(pipe, **inputs_shared, **inputs_posi),
+            "dual_head_joint_sft_with_decay_factor": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTDualHeadJointLossWithDecayFactor(pipe, **inputs_shared, **inputs_posi),
         }
         self.max_timestep_boundary = max_timestep_boundary
         self.min_timestep_boundary = min_timestep_boundary
+        self.depth_loss_weight = float(depth_loss_weight)
+        self.depth_latent_scale = float(depth_latent_scale)
 
     def _freeze_all_parameters_in_pipe(self):
         if hasattr(self.pipe, "parameters"):
@@ -312,6 +424,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             "vace_scale": 1,
             "max_timestep_boundary": self.max_timestep_boundary,
             "min_timestep_boundary": self.min_timestep_boundary,
+            "depth_loss_weight": self.depth_loss_weight,
+            "depth_latent_scale": self.depth_latent_scale,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
@@ -327,9 +441,13 @@ class WanTrainingModule(DiffusionTrainingModule):
 
 
 class DualHeadWanTrainingModule(WanTrainingModule):
-    def __init__(self, *args, depth_loss_weight=1.0, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.depth_loss_weight = depth_loss_weight
+    def __init__(self, *args, depth_loss_weight=1.0, depth_latent_scale=1.0, **kwargs):
+        super().__init__(
+            *args,
+            depth_loss_weight=depth_loss_weight,
+            depth_latent_scale=depth_latent_scale,
+            **kwargs,
+        )
 
 
 def wan_parser():
@@ -362,6 +480,35 @@ def wan_parser():
         action="store_true",
         help="Freeze parameters of preset LoRA adapters loaded via --preset_lora_path.",
     )
+    parser.add_argument(
+        "--init_dit_ckpt",
+        type=str,
+        default=None,
+        help="Path to an initialization checkpoint to load into pipe.dit (e.g., Stage2 TTC checkpoint).",
+    )
+    parser.add_argument(
+        "--init_dit_ckpt_target",
+        type=str,
+        default="auto",
+        choices=["auto", "dit", "dit2", "both"],
+        help=(
+            "Which DiT module to load --init_dit_ckpt into. "
+            "auto selects 'dit' for high_noise_model and 'dit2' for low_noise_model."
+        ),
+    )
+    parser.add_argument(
+        "--depth_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for depth loss (only used by dual_head_joint_* tasks).",
+    )
+    parser.add_argument(
+        "--depth_latent_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to depth latents inside the joint diffusion loss.",
+    )
+
     parser.add_argument(
         "--initialize_model_on_cpu",
         default=False,
@@ -433,6 +580,11 @@ if __name__ == "__main__":
         device="cpu" if args.initialize_model_on_cpu else accelerator.device,
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
+        init_dit_ckpt=args.init_dit_ckpt,
+        init_dit_ckpt_prefixes=None,
+        init_dit_ckpt_target=args.init_dit_ckpt_target,
+        depth_loss_weight=args.depth_loss_weight,
+        depth_latent_scale=args.depth_latent_scale,
     )
 
     model_logger = ModelLogger(
@@ -449,5 +601,7 @@ if __name__ == "__main__":
         "direct_distill:train": launch_training_task,
         "dual_head_sft": launch_training_task,
         "dual_head_sft_with_decay_factor": launch_training_task,
+        "dual_head_joint_sft": launch_training_task,
+        "dual_head_joint_sft_with_decay_factor": launch_training_task,
     }
     launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

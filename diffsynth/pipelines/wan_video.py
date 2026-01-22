@@ -29,6 +29,7 @@ from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 from ..models.wan_video_ttc_controller import WanTTCTokenizer
 from ..models.wan_video_depth_head import WanDepthHead
+from ..models.wan_video_depth_adapter import WanDepthToVideoAdapter
 
 
 class WanVideoPipeline(BasePipeline):
@@ -162,6 +163,19 @@ class WanVideoPipeline(BasePipeline):
             pipe.dit.depth_head = WanDepthHead(in_dim=pipe.dit.dim, out_dim=64).to(device=pipe.device, dtype=pipe.torch_dtype)
         if pipe.dit2 is not None and not hasattr(pipe.dit2, "depth_head") and hasattr(pipe.dit2, "dim"):
             pipe.dit2.depth_head = WanDepthHead(in_dim=pipe.dit2.dim, out_dim=64).to(device=pipe.device, dtype=pipe.torch_dtype)
+
+        z_dim = None
+        if pipe.vae is not None and hasattr(pipe.vae, 'model') and hasattr(pipe.vae.model, 'z_dim'):
+            try:
+                z_dim = int(pipe.vae.model.z_dim)
+            except Exception:
+                z_dim = None
+
+        if z_dim is not None:
+            if pipe.dit is not None and (not hasattr(pipe.dit, 'depth_to_video') or getattr(pipe.dit, 'depth_to_video') is None):
+                pipe.dit.depth_to_video = WanDepthToVideoAdapter(in_channels=z_dim, out_channels=z_dim).to(device=pipe.device, dtype=pipe.torch_dtype)
+            if pipe.dit2 is not None and (not hasattr(pipe.dit2, 'depth_to_video') or getattr(pipe.dit2, 'depth_to_video') is None):
+                pipe.dit2.depth_to_video = WanDepthToVideoAdapter(in_channels=z_dim, out_channels=z_dim).to(device=pipe.device, dtype=pipe.torch_dtype)
 
         # Size division factor
         if pipe.vae is not None:
@@ -1263,6 +1277,7 @@ def model_fn_wan_video(
     vap: MotWanModel = None,
     animate_adapter: WanAnimateAdapter = None,
     latents: torch.Tensor = None,
+    depth_latents: Optional[torch.Tensor] = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     clip_feature: Optional[torch.Tensor] = None,
@@ -1299,6 +1314,7 @@ def model_fn_wan_video(
             motion_controller=motion_controller,
             vace=vace,
             latents=latents,
+            depth_latents=depth_latents,
             timestep=timestep,
             context=context,
             clip_feature=clip_feature,
@@ -1316,7 +1332,7 @@ def model_fn_wan_video(
             sliding_window_size, sliding_window_stride,
             latents.device, latents.dtype,
             model_kwargs=model_kwargs,
-            tensor_names=["latents", "y"],
+            tensor_names=["latents", "y", "depth_latents"],
             batch_size=2 if cfg_merge else 1
         )
     # LongCat-Video
@@ -1398,6 +1414,14 @@ def model_fn_wan_video(
         context = torch.cat([context, ttc_tokens], dim=1)
 
     x = latents
+    if depth_latents is not None:
+        if not torch.is_tensor(depth_latents):
+            depth_latents = torch.as_tensor(depth_latents)
+        depth_latents = depth_latents.to(device=x.device, dtype=x.dtype)
+        if hasattr(dit, "depth_to_video") and getattr(dit, "depth_to_video") is not None:
+            x = x + dit.depth_to_video(depth_latents)
+        else:
+            x = x + depth_latents
     # Merged cfg
     if x.shape[0] != context.shape[0]:
         x = torch.concat([x] * context.shape[0], dim=0)
@@ -1600,6 +1624,7 @@ def model_fn_wan_video(
 def model_fn_longcat_video(
     dit: LongCatVideoTransformer3DModel,
     latents: torch.Tensor = None,
+    depth_latents: Optional[torch.Tensor] = None,
     timestep: torch.Tensor = None,
     context: torch.Tensor = None,
     longcat_latents: torch.Tensor = None,

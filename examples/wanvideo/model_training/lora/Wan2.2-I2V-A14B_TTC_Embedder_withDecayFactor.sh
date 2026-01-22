@@ -22,7 +22,7 @@ export MASTER_PORT="${MASTER_PORT:-29500}"
 
 NUM_WORKERS="${NUM_WORKERS:-8}"
 
-GPU_IDS="${GPU_IDS:-0,1,2,3}"
+GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_IDS}}"
 
 if [[ -z "${NUM_GPUS:-}" ]]; then
@@ -35,12 +35,17 @@ GEOMETRY_PATH="/baai-cwm-backup/cwm/tong.liu/geodepthnew/"
 METADATA_CSV="/baai-cwm-vepfs/cwm/cheng.li/liutong/MM-AU/video1.csv"
 TTC_JSON="/baai-cwm-backup/cwm/tong.liu/ttcnew1.json"
 
+# Stage 1 RGB LoRA (frozen)
 HIGH_LORA="/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/models/train/Wan2.2-I2V-A14B_high_noise_lora/epoch-4.safetensors"
 LOW_LORA="/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/models/train/Wan2.2-I2V-A14B_low_noise_lora/epoch-4.safetensors"
 
+# Stage 2 TTC checkpoint (frozen)
+TTC_INIT_HIGH="/baai-cwm-backup/cwm/tong.liu/outputckpt/Wan2.2-I2V-A14B_high_noise_ttc_only49_frozen_lora/epoch-4.safetensors"
+TTC_INIT_LOW="/baai-cwm-backup/cwm/tong.liu/outputckpt/Wan2.2-I2V-A14B_low_noise_ttc_only49_frozen_lora/epoch-4.safetensors"
+
 OUT_ROOT="${OUT_ROOT:-/baai-cwm-backup/cwm/tong.liu/outputckpt}"
-OUT_HIGH="${OUT_ROOT}/Wan2.2-I2V-A14B_high_noise_ttc_49embedderfree"
-OUT_LOW="${OUT_ROOT}/Wan2.2-I2V-A14B_low_noise_ttc_49embedderfree"
+OUT_HIGH="${OUT_ROOT}/Wan2.2-I2V-A14B_high_noise_depth_joint49_frozen_lora"
+OUT_LOW="${OUT_ROOT}/Wan2.2-I2V-A14B_low_noise_depth_joint49_frozen_lora"
 
 HEIGHT="${HEIGHT:-320}"
 WIDTH="${WIDTH:-368}"
@@ -49,8 +54,10 @@ DATASET_REPEAT="${DATASET_REPEAT:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 NUM_EPOCHS="${NUM_EPOCHS:-5}"
 
-TASK="${TASK:-dual_head_sft_with_decay_factor}"
-TRAINABLE_MODELS="${TRAINABLE_MODELS:-dit.ttc_embedder,dit.depth_head}"
+TASK="${TASK:-dual_head_joint_sft_with_decay_factor}"
+TRAINABLE_MODELS="${TRAINABLE_MODELS:-dit.depth_head,dit.depth_to_video}"
+DEPTH_LOSS_WEIGHT="${DEPTH_LOSS_WEIGHT:-0.05}"
+DEPTH_LATENT_SCALE="${DEPTH_LATENT_SCALE:-1.0}"
 
 FREEZE_PRESET_LORA="${FREEZE_PRESET_LORA:-1}"
 
@@ -58,7 +65,7 @@ if [[ -z "${REMOVE_PREFIX_IN_CKPT:-}" ]]; then
   if [[ "${TRAINABLE_MODELS}" == *","* ]]; then
     REMOVE_PREFIX_IN_CKPT="pipe.dit."
   else
-    REMOVE_PREFIX_IN_CKPT="pipe.dit.ttc_embedder."
+    REMOVE_PREFIX_IN_CKPT="pipe.dit.${TRAINABLE_MODELS#dit.}."
   fi
 fi
 
@@ -92,6 +99,14 @@ if [[ ! -f "${LOW_LORA}" ]]; then
   echo "ERROR: LOW_LORA not found: ${LOW_LORA}" >&2
   exit 1
 fi
+if [[ ! -f "${TTC_INIT_HIGH}" ]]; then
+  echo "ERROR: TTC_INIT_HIGH not found: ${TTC_INIT_HIGH}" >&2
+  exit 1
+fi
+if [[ ! -f "${TTC_INIT_LOW}" ]]; then
+  echo "ERROR: TTC_INIT_LOW not found: ${TTC_INIT_LOW}" >&2
+  exit 1
+fi
 
 mkdir -p "${OUT_HIGH}" "${OUT_LOW}"
 
@@ -114,6 +129,8 @@ COMMON_ARGS=(
   --use_gradient_checkpointing_offload
   --task "${TASK}"
   --dataset_num_workers "${NUM_WORKERS}"
+  --depth_loss_weight "${DEPTH_LOSS_WEIGHT}"
+  --depth_latent_scale "${DEPTH_LATENT_SCALE}"
 )
 
 if [[ "${FREEZE_PRESET_LORA}" == "1" ]]; then
@@ -128,6 +145,7 @@ accelerate launch \
   --model_id_with_origin_paths "Wan-AI/Wan2.2-I2V-A14B:high_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-I2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-I2V-A14B:Wan2.1_VAE.pth" \
   --preset_lora_path "${HIGH_LORA}" \
   --preset_lora_model "dit" \
+  --init_dit_ckpt "${TTC_INIT_HIGH}" \
   --output_path "${OUT_HIGH}" \
   --max_timestep_boundary 0.358 \
   --min_timestep_boundary 0
@@ -140,6 +158,7 @@ accelerate launch \
   --model_id_with_origin_paths "Wan-AI/Wan2.2-I2V-A14B:low_noise_model/diffusion_pytorch_model*.safetensors,Wan-AI/Wan2.2-I2V-A14B:models_t5_umt5-xxl-enc-bf16.pth,Wan-AI/Wan2.2-I2V-A14B:Wan2.1_VAE.pth" \
   --preset_lora_path "${LOW_LORA}" \
   --preset_lora_model "dit" \
+  --init_dit_ckpt "${TTC_INIT_LOW}" \
   --output_path "${OUT_LOW}" \
   --max_timestep_boundary 1 \
   --min_timestep_boundary 0.358
