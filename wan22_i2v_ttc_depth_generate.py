@@ -8,6 +8,9 @@ import json
 import glob
 import argparse
 import secrets
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from collections import defaultdict
@@ -16,7 +19,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-from diffsynth import save_video
 from diffsynth.pipelines.wan_video import WanVideoPipeline
 from diffsynth.core.loader import ModelConfig
 
@@ -27,6 +29,143 @@ DEFAULT_NEGATIVE_PROMPT = (
     "low quality, JPEG artifacts, ugly, broken parts, malformed limbs, "
     "bad hands, bad face, fused fingers, motionless frame, cluttered background"
 )
+
+
+try:
+    from diffsynth import save_video as _diffsynth_save_video  # type: ignore
+except Exception:
+    _diffsynth_save_video = None
+
+
+def _quality_to_crf(quality: int) -> int:
+    q = int(quality)
+    if q < 0:
+        q = 0
+    if q > 10:
+        q = 10
+    crf = int(round(35 - 2 * q))
+    if crf < 0:
+        crf = 0
+    if crf > 51:
+        crf = 51
+    return crf
+
+
+def save_video(frames: Any, out_path: str, fps: int = 15, quality: int = 5) -> None:
+    if _diffsynth_save_video is not None:
+        try:
+            _diffsynth_save_video(frames, out_path, fps=int(fps), quality=int(quality))
+            return
+        except TypeError:
+            try:
+                _diffsynth_save_video(frames, out_path, fps=int(fps))
+                return
+            except TypeError:
+                _diffsynth_save_video(frames, out_path)
+                return
+
+    if isinstance(frames, torch.Tensor):
+        frames = frames.detach().cpu().numpy()
+
+    arr = np.asarray(frames)
+    if arr.ndim != 4:
+        raise ValueError(f"save_video expects 4D array (T,H,W,C), got shape={arr.shape}")
+
+    if arr.dtype != np.uint8:
+        arr = np.clip(arr, 0, 255).astype(np.uint8, copy=False)
+
+    if arr.shape[-1] == 1:
+        arr = np.repeat(arr, 3, axis=-1)
+    elif arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    elif arr.shape[-1] != 3:
+        raise ValueError(f"save_video expects C in {{1,3,4}}, got C={arr.shape[-1]}")
+
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    crf = _quality_to_crf(int(quality))
+
+    try:
+        import imageio.v2 as imageio  # type: ignore
+
+        writer = None
+        try:
+            try:
+                writer = imageio.get_writer(
+                    out_path,
+                    fps=int(fps),
+                    codec="libx264",
+                    ffmpeg_params=["-pix_fmt", "yuv420p", "-crf", str(crf)],
+                    macro_block_size=None,
+                )
+            except TypeError:
+                writer = imageio.get_writer(
+                    out_path,
+                    fps=int(fps),
+                    codec="libx264",
+                    ffmpeg_params=["-pix_fmt", "yuv420p", "-crf", str(crf)],
+                )
+
+            for fr in arr:
+                writer.append_data(fr)
+            return
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    try:
+        import cv2  # type: ignore
+
+        h, w = int(arr.shape[1]), int(arr.shape[2])
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        vw = cv2.VideoWriter(out_path, fourcc, float(fps), (w, h))
+        if not vw.isOpened():
+            raise RuntimeError("cv2.VideoWriter failed to open output file")
+
+        try:
+            for fr in arr:
+                vw.write(fr[:, :, ::-1])
+            return
+        finally:
+            vw.release()
+    except Exception:
+        pass
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("Failed to save video: no diffsynth.save_video, imageio, cv2, or ffmpeg available")
+
+    with tempfile.TemporaryDirectory(prefix="tmp_video_frames_") as tmpdir:
+        pattern = os.path.join(tmpdir, "frame_%06d.png")
+        for i, fr in enumerate(arr):
+            Image.fromarray(fr).save(os.path.join(tmpdir, f"frame_{i:06d}.png"))
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-framerate",
+            str(int(fps)),
+            "-i",
+            pattern,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            str(crf),
+            out_path,
+        ]
+        subprocess.run(cmd, check=True)
 
 
 def _str2bool(v: Any) -> bool:
@@ -62,16 +201,56 @@ def _infer_runtime_args_from_env() -> Tuple[str, int, int]:
     return "cuda:0", 0, 1
 
 
+def _select_safetensors_files(files: List[str]) -> List[str]:
+    files = [f for f in files if f.endswith(".safetensors")]
+    if not files:
+        return []
+
+    shard_pat = re.compile(r"^(?P<prefix>.+)-(?P<idx>\d+)-of-(?P<tot>\d+)(?P<bf16>-bf16)?\.safetensors$")
+    sharded: Dict[Tuple[str, int, int], Dict[str, str]] = {}
+    unsharded: List[str] = []
+
+    for f in files:
+        base = os.path.basename(f)
+        m = shard_pat.match(base)
+        if not m:
+            unsharded.append(f)
+            continue
+        prefix = m.group("prefix")
+        idx = int(m.group("idx"))
+        tot = int(m.group("tot"))
+        is_bf16 = m.group("bf16") is not None
+        key = (prefix, idx, tot)
+        if key not in sharded:
+            sharded[key] = {}
+        sharded[key]["bf16" if is_bf16 else "fp"] = f
+
+    if sharded:
+        picked: List[Tuple[int, str]] = []
+        for (prefix, idx, tot), variants in sharded.items():
+            if "bf16" in variants:
+                picked.append((idx, variants["bf16"]))
+            elif "fp" in variants:
+                picked.append((idx, variants["fp"]))
+        picked.sort(key=lambda x: x[0])
+        return [p for _, p in picked]
+
+    bf16 = [f for f in unsharded if f.endswith("-bf16.safetensors")]
+    if bf16:
+        bf16.sort()
+        return bf16
+    unsharded.sort()
+    return unsharded
+
+
 def _sorted_ckpts(pattern: str) -> List[str]:
     files = glob.glob(pattern)
     if not files:
         raise FileNotFoundError(f"No checkpoints found for pattern: {pattern}")
-
-    def _key(p: str):
-        m = re.search(r"-(\d+)-of-(\d+)", p)
-        return (int(m.group(1)) if m else 0, p)
-
-    return sorted(files, key=_key)
+    selected = _select_safetensors_files(files)
+    if not selected:
+        raise FileNotFoundError(f"No usable safetensors for pattern: {pattern}")
+    return selected
 
 
 def _pil_bicubic_resample() -> int:
@@ -123,27 +302,44 @@ def _read_csv_rows(csv_path: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     with open(csv_path, "r", encoding="utf-8", errors="replace") as f:
         for raw in f:
-            line = raw.lstrip("\ufeff").rstrip().rstrip(";")
+            line = raw.lstrip("\ufeff").rstrip("\n").rstrip("\r")
             if not line:
                 continue
+
             lower = line.lower().strip()
             if lower.startswith("video,prompt") or lower.startswith("filename,prompt"):
                 continue
-            row = next(csv.reader([line]))
-            if not row:
-                continue
-            name = row[0].strip().strip('"').strip()
-            if not name:
-                continue
+
+            try:
+                row = next(csv.reader([line]))
+            except Exception:
+                row = []
+
             if len(row) >= 2:
+                name = row[0].strip().strip('"').strip()
                 prompt = ",".join(row[1:]).strip().strip('"').strip()
-            else:
-                idx = line.find(",")
-                if idx < 0:
-                    continue
-                prompt = line[idx + 1 :].strip().strip('"').strip()
-            if name and prompt:
-                out.append((name, prompt))
+                if name.lower().endswith(".mp4,"):
+                    name = name[:-1]
+                if name and prompt:
+                    out.append((name, prompt))
+                continue
+
+            s = row[0] if len(row) == 1 else line
+            s = s.strip()
+
+            m = re.search(r"\.mp4,", s, flags=re.IGNORECASE)
+            if m is None:
+                continue
+
+            name = s[: m.start() + 4].strip().strip('"').strip()
+            rest = s[m.end() :].strip()
+
+            rest = rest.lstrip('"').rstrip('"').strip()
+            rest = rest.replace('""', '"').strip()
+
+            if name and rest:
+                out.append((name, rest))
+
     return out
 
 
@@ -259,7 +455,9 @@ def _load_ttc_json(ttc_json_path: str) -> Dict[str, List[float]]:
         for item in data:
             if not isinstance(item, dict):
                 continue
-            vid = item.get("video") or item.get("video_name") or item.get("filename") or item.get("file") or item.get("path")
+            vid = item.get("video") or item.get("video_name") or item.get("filename") or item.get("file") or item.get(
+                "path"
+            )
             seq = item.get("ttc") or item.get("TTC") or item.get("ttc_frames") or item.get("values")
             if vid is not None and seq is not None:
                 _register(str(vid), seq)
@@ -331,24 +529,123 @@ def _strip_prefixes(sd: Dict[str, torch.Tensor], prefixes: List[str]) -> Dict[st
     return out
 
 
-def _load_ckpt_into_module(module: torch.nn.Module, ckpt_path: str, tag: str) -> None:
+def _get_module_by_path(root: torch.nn.Module, path: str) -> Optional[torch.nn.Module]:
+    cur: Any = root
+    if path == "":
+        return None
+    for part in path.split("."):
+        if not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+        if cur is None:
+            return None
+    if isinstance(cur, torch.nn.Module):
+        return cur
+    return None
+
+
+def _load_ckpt_into_module(
+    module: torch.nn.Module,
+    ckpt_path: str,
+    tag: str,
+    allow_prefixes: Optional[List[str]] = None,
+) -> None:
     sd_raw = _load_state_dict_any(ckpt_path)
-    sd = _strip_prefixes(
-        sd_raw,
-        prefixes=[
-            "module.",
-            "pipe.",
-            "pipe.dit.",
-            "pipe.dit2.",
-            "dit.",
-            "dit2.",
-        ],
-    )
-    incompatible = module.load_state_dict(sd, strict=False)
-    missing = len(getattr(incompatible, "missing_keys", []))
-    unexpected = len(getattr(incompatible, "unexpected_keys", []))
+    sd = _strip_prefixes(sd_raw, prefixes=["module.", "pipe.", "pipe.dit.", "pipe.dit2.", "dit.", "dit2."])
+
+    prefixes: Optional[Tuple[str, ...]] = None
+    if allow_prefixes:
+        prefixes = tuple(allow_prefixes)
+        sd = {k: v for k, v in sd.items() if k.startswith(prefixes)}
+
+    loaded_total = 0
+    missing_total = 0
+    unexpected_total = 0
+
+    if prefixes:
+        used_any = False
+        for p in prefixes:
+            sub = _get_module_by_path(module, p.rstrip("."))
+            if sub is None:
+                continue
+            part = {k[len(p) :]: v for k, v in sd.items() if k.startswith(p)}
+            if not part:
+                continue
+            incompatible = sub.load_state_dict(part, strict=False)
+            missing = len(getattr(incompatible, "missing_keys", []))
+            unexpected = len(getattr(incompatible, "unexpected_keys", []))
+            loaded = max(0, len(part) - unexpected)
+            loaded_total += loaded
+            missing_total += missing
+            unexpected_total += unexpected
+            used_any = True
+
+        if not used_any:
+            incompatible = module.load_state_dict(sd, strict=False)
+            missing_total = len(getattr(incompatible, "missing_keys", []))
+            unexpected_total = len(getattr(incompatible, "unexpected_keys", []))
+            loaded_total = max(0, len(sd) - unexpected_total)
+    else:
+        incompatible = module.load_state_dict(sd, strict=False)
+        missing_total = len(getattr(incompatible, "missing_keys", []))
+        unexpected_total = len(getattr(incompatible, "unexpected_keys", []))
+        loaded_total = max(0, len(sd) - unexpected_total)
+
     if os.getenv("RANK", "0") == "0":
-        print(f"[ckpt:{tag}] {ckpt_path} | missing={missing} unexpected={unexpected}")
+        print(f"[ckpt:{tag}] {ckpt_path} | loaded={loaded_total} missing={missing_total} unexpected={unexpected_total}")
+
+
+def _load_ttc_embedder_ckpt(dit: torch.nn.Module, ckpt_path: str, tag: str) -> None:
+    sd_raw = _load_state_dict_any(ckpt_path)
+    sd = _strip_prefixes(sd_raw, prefixes=["module.", "pipe.", "pipe.dit.", "pipe.dit2.", "dit.", "dit2."])
+
+    if any(k.startswith("ttc_embedder.") for k in sd.keys()):
+        sd = {k[len("ttc_embedder.") :]: v for k, v in sd.items() if k.startswith("ttc_embedder.")}
+
+    sd = {k: v for k, v in sd.items() if k.startswith(("pos_mlp.", "value_mlp."))}
+    if not sd:
+        raise RuntimeError(f"No TTC keys found in checkpoint: {ckpt_path}")
+
+    ttc_mod = getattr(dit, "ttc_embedder", None)
+    if isinstance(ttc_mod, torch.nn.Module):
+        incompatible = ttc_mod.load_state_dict(sd, strict=False)
+        missing = len(getattr(incompatible, "missing_keys", []))
+        unexpected = len(getattr(incompatible, "unexpected_keys", []))
+        loaded = max(0, len(sd) - unexpected)
+        if os.getenv("RANK", "0") == "0":
+            print(
+                f"[ckpt:{tag}] {ckpt_path} | loaded={loaded} missing={missing} unexpected={unexpected} (into ttc_embedder)"
+            )
+        return
+
+    loaded_total = 0
+    missing_total = 0
+    unexpected_total = 0
+    used_any = False
+
+    for p in ("pos_mlp.", "value_mlp."):
+        sub = _get_module_by_path(dit, p.rstrip("."))
+        if sub is None:
+            continue
+        part = {k[len(p) :]: v for k, v in sd.items() if k.startswith(p)}
+        if not part:
+            continue
+        incompatible = sub.load_state_dict(part, strict=False)
+        missing = len(getattr(incompatible, "missing_keys", []))
+        unexpected = len(getattr(incompatible, "unexpected_keys", []))
+        loaded = max(0, len(part) - unexpected)
+        loaded_total += loaded
+        missing_total += missing
+        unexpected_total += unexpected
+        used_any = True
+
+    if not used_any:
+        raise RuntimeError("dit.ttc_embedder is missing and no pos_mlp/value_mlp modules were found on dit")
+
+    if os.getenv("RANK", "0") == "0":
+        print(
+            f"[ckpt:{tag}] {ckpt_path} | loaded={loaded_total} missing={missing_total} unexpected={unexpected_total} (into pos_mlp/value_mlp)"
+        )
 
 
 def _to_uint8_video(x: torch.Tensor) -> np.ndarray:
@@ -401,10 +698,16 @@ def _gather_wan_model_configs(model_root: str, model_id: str) -> List[ModelConfi
         alt=os.path.join(model_root, "models_t5_umt5-xxl-enc-bf16.safetensors"),
     )
 
-    vae_path = _find_required_file(
-        os.path.join(model_root, "Wan2.1_VAE.pth"),
-        alt=os.path.join(model_root, "Wan2.1_VAE.safetensors"),
-    )
+    try:
+        vae_path = _find_required_file(
+            os.path.join(model_root, "Wan2.2_VAE.pth"),
+            alt=os.path.join(model_root, "Wan2.2_VAE.safetensors"),
+        )
+    except FileNotFoundError:
+        vae_path = _find_required_file(
+            os.path.join(model_root, "Wan2.1_VAE.pth"),
+            alt=os.path.join(model_root, "Wan2.1_VAE.safetensors"),
+        )
 
     return [
         ModelConfig(
@@ -435,7 +738,8 @@ def _gather_wan_model_configs(model_root: str, model_id: str) -> List[ModelConfi
 
 
 def build_pipeline(
-    device: str,
+    device_high: str,
+    device_low: str,
     model_id: str,
     model_root: str,
     tokenizer_path: Optional[str],
@@ -450,7 +754,6 @@ def build_pipeline(
     model_root = str(model_root)
     model_configs = _gather_wan_model_configs(model_root, model_id=str(model_id))
 
-    tokenizer_config = None
     if tokenizer_path:
         tokenizer_config = ModelConfig(path=str(tokenizer_path))
     else:
@@ -458,30 +761,63 @@ def build_pipeline(
 
     pipe = WanVideoPipeline.from_pretrained(
         torch_dtype=torch.bfloat16,
-        device=device,
+        device="cpu",
         model_configs=model_configs,
         tokenizer_config=tokenizer_config,
         audio_processor_config=None,
     )
 
-    if hasattr(pipe, "enable_vram_management") and callable(getattr(pipe, "enable_vram_management")):
-        try:
-            pipe.enable_vram_management()
-        except Exception:
-            pass
-
     pipe.load_lora(pipe.dit, lora_high, alpha=float(lora_alpha))
     if getattr(pipe, "dit2", None) is not None:
         pipe.load_lora(pipe.dit2, lora_low, alpha=float(lora_alpha))
 
-    _load_ckpt_into_module(pipe.dit, ttc_ckpt_high, tag="ttc_high")
-    _load_ckpt_into_module(pipe.dit, depth_ckpt_high, tag="depth_high")
+    _load_ckpt_into_module(
+        pipe.dit,
+        depth_ckpt_high,
+        tag="depth_high",
+        allow_prefixes=["depth_head.", "depth_to_video."],
+    )
 
+    _load_ttc_embedder_ckpt(pipe.dit, ttc_ckpt_high, tag="ttc_high")
+
+    if pipe.dit2 is not None:
+        _load_ckpt_into_module(
+            pipe.dit2,
+            depth_ckpt_low,
+            tag="depth_low",
+            allow_prefixes=["depth_head.", "depth_to_video."],
+        )
+        _load_ttc_embedder_ckpt(pipe.dit2, ttc_ckpt_low, tag="ttc_low")
+
+    dev_high = torch.device(device_high)
+    dev_low = torch.device(device_low)
+
+    if pipe.dit is not None:
+        pipe.dit.to(device=dev_high, dtype=pipe.torch_dtype).eval()
     if getattr(pipe, "dit2", None) is not None:
-        _load_ckpt_into_module(pipe.dit2, ttc_ckpt_low, tag="ttc_low")
-        _load_ckpt_into_module(pipe.dit2, depth_ckpt_low, tag="depth_low")
+        pipe.dit2.to(device=dev_low, dtype=pipe.torch_dtype).eval()
+
+    pipe.device = dev_high
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     return pipe
+
+
+def _move_all_tensors(obj: Any, device: torch.device) -> Any:
+    if torch.is_tensor(obj):
+        return obj.to(device=device)
+    if isinstance(obj, dict):
+        return {k: _move_all_tensors(v, device) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_move_all_tensors(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_all_tensors(v, device) for v in obj)
+    return obj
 
 
 @torch.no_grad()
@@ -490,7 +826,7 @@ def generate_one(
     prompt: str,
     negative_prompt: str,
     input_image: Image.Image,
-    ttc_tensor: torch.Tensor,
+    ttc_tensor_cpu: torch.Tensor,
     seed: int,
     height: int,
     width: int,
@@ -503,6 +839,9 @@ def generate_one(
     tile_size: Tuple[int, int],
     tile_stride: Tuple[int, int],
     sigma_shift: float,
+    device_high: torch.device,
+    device_low: torch.device,
+    decode_device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     pipe.scheduler.set_timesteps(num_steps, denoising_strength=1.0, shift=sigma_shift)
 
@@ -523,7 +862,7 @@ def generate_one(
         "tiled": bool(tiled),
         "tile_size": tuple(tile_size),
         "tile_stride": tuple(tile_stride),
-        "ttc": ttc_tensor,
+        "ttc": ttc_tensor_cpu,
         "use_gradient_checkpointing": False,
         "use_gradient_checkpointing_offload": False,
         "vace_scale": 1.0,
@@ -531,48 +870,106 @@ def generate_one(
         "min_timestep_boundary": 0.0,
     }
 
+    pipe.device = device_high
+
+    if getattr(pipe, "text_encoder", None) is not None:
+        pipe.text_encoder.to(device=device_high, dtype=pipe.torch_dtype).eval()
+    if getattr(pipe, "vae", None) is not None:
+        pipe.vae.to(device=device_high, dtype=pipe.torch_dtype).eval()
+    if getattr(pipe, "image_encoder", None) is not None:
+        need_clip = False
+        try:
+            need_clip = bool(getattr(pipe.dit, "require_clip_embedding", False))
+            if getattr(pipe, "dit2", None) is not None:
+                need_clip = need_clip or bool(getattr(pipe.dit2, "require_clip_embedding", False))
+        except Exception:
+            need_clip = False
+        if need_clip:
+            pipe.image_encoder.to(device=device_high, dtype=pipe.torch_dtype).eval()
+
     for unit in pipe.units:
         inputs_shared, inputs_posi, inputs_nega = pipe.unit_runner(unit, pipe, inputs_shared, inputs_posi, inputs_nega)
 
     if "latents" not in inputs_shared:
         raise RuntimeError("Pipeline units did not produce 'latents'.")
 
-    _set_seed(seed)
-    depth_latents = torch.zeros_like(inputs_shared["latents"], device=inputs_shared["latents"].device, dtype=inputs_shared["latents"].dtype)
+    if getattr(pipe, "text_encoder", None) is not None:
+        pipe.text_encoder.to("cpu")
+    if getattr(pipe, "image_encoder", None) is not None:
+        try:
+            pipe.image_encoder.to("cpu")
+        except Exception:
+            pass
+    if getattr(pipe, "vae", None) is not None:
+        pipe.vae.to("cpu")
 
-    pipe.load_models_to_device(pipe.in_iteration_models)
-    models = {
-        name: getattr(pipe, name)
-        for name in pipe.in_iteration_models
-        if getattr(pipe, name, None) is not None
+    _set_seed(seed)
+
+    inputs_shared = _move_all_tensors(inputs_shared, device_high)
+    inputs_posi = _move_all_tensors(inputs_posi, device_high)
+    inputs_nega = _move_all_tensors(inputs_nega, device_high)
+
+    if not torch.is_tensor(inputs_shared["latents"]):
+        raise TypeError("latents must be a torch.Tensor")
+
+    depth_latents = torch.zeros_like(inputs_shared["latents"], device=device_high, dtype=inputs_shared["latents"].dtype)
+
+    models_high: Dict[str, Any] = {
+        "dit": pipe.dit,
+        "motion_controller": getattr(pipe, "motion_controller", None),
+        "vace": getattr(pipe, "vace", None),
+        "vap": getattr(pipe, "vap", None),
+        "animate_adapter": getattr(pipe, "animate_adapter", None),
+    }
+    models_low: Dict[str, Any] = {
+        "dit": getattr(pipe, "dit2", None),
+        "motion_controller": getattr(pipe, "motion_controller", None),
+        "vace": getattr(pipe, "vace2", getattr(pipe, "vace", None)),
+        "vap": getattr(pipe, "vap", None),
+        "animate_adapter": getattr(pipe, "animate_adapter", None),
     }
 
-    t_max = float(pipe.scheduler.timesteps.max().item())
+    active_models = models_high
+    active_device = device_high
     boundary_ts = float(switch_boundary)
+
+    t_max = float(pipe.scheduler.timesteps.max().item())
     if 0.0 <= boundary_ts <= 1.0:
         boundary_ts = boundary_ts * t_max
 
-    autocast_ctx = (
-        torch.autocast(device_type="cuda", dtype=pipe.torch_dtype)
-        if str(pipe.device).startswith("cuda")
-        else torch.autocast(device_type="cpu", dtype=torch.bfloat16)
-    )
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=pipe.torch_dtype) if active_device.type == "cuda" else None
 
     for progress_id, ts in enumerate(pipe.scheduler.timesteps):
         ts_val = float(ts.item())
 
-        if getattr(pipe, "dit2", None) is not None and ts_val < boundary_ts and models.get("dit") is not pipe.dit2:
-            if hasattr(pipe, "in_iteration_models_2"):
-                pipe.load_models_to_device(pipe.in_iteration_models_2)
-            models["dit"] = pipe.dit2
-            if getattr(pipe, "vace2", None) is not None:
-                models["vace"] = pipe.vace2
+        if models_low["dit"] is not None and ts_val < boundary_ts and active_models is models_high:
+            inputs_shared = _move_all_tensors(inputs_shared, device_low)
+            inputs_posi = _move_all_tensors(inputs_posi, device_low)
+            inputs_nega = _move_all_tensors(inputs_nega, device_low)
+            depth_latents = depth_latents.to(device_low)
+            active_models = models_low
+            active_device = device_low
+            pipe.device = active_device
+            autocast_ctx = None
 
-        timestep = ts.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
+        timestep = ts.unsqueeze(0).to(dtype=pipe.torch_dtype, device=active_device)
 
-        with autocast_ctx:
+        if autocast_ctx is None and active_device.type == "cuda":
+            autocast_ctx = torch.autocast(device_type="cuda", dtype=pipe.torch_dtype)
+
+        if autocast_ctx is not None:
+            with autocast_ctx:
+                out_pos = pipe.model_fn(
+                    **active_models,
+                    **inputs_shared,
+                    **inputs_posi,
+                    depth_latents=depth_latents,
+                    timestep=timestep,
+                    progress_id=progress_id,
+                )
+        else:
             out_pos = pipe.model_fn(
-                **models,
+                **active_models,
                 **inputs_shared,
                 **inputs_posi,
                 depth_latents=depth_latents,
@@ -580,34 +977,46 @@ def generate_one(
                 progress_id=progress_id,
             )
 
-            if cfg_scale != 1.0:
-                if cfg_merge:
-                    if not isinstance(out_pos, dict):
-                        raise TypeError("cfg_merge=True requires dict output for dual-head generation")
-                    vp, vn = out_pos["video"].chunk(2, dim=0)
-                    dp, dn = out_pos["depth"].chunk(2, dim=0)
+        if cfg_scale != 1.0:
+            if cfg_merge:
+                if not isinstance(out_pos, dict):
+                    raise TypeError("cfg_merge=True requires dict output for dual-head generation")
+                vp, vn = out_pos["video"].chunk(2, dim=0)
+                dp, dn = out_pos["depth"].chunk(2, dim=0)
+            else:
+                if autocast_ctx is not None:
+                    with autocast_ctx:
+                        out_neg = pipe.model_fn(
+                            **active_models,
+                            **inputs_shared,
+                            **inputs_nega,
+                            depth_latents=depth_latents,
+                            timestep=timestep,
+                            progress_id=progress_id,
+                        )
                 else:
                     out_neg = pipe.model_fn(
-                        **models,
+                        **active_models,
                         **inputs_shared,
                         **inputs_nega,
                         depth_latents=depth_latents,
                         timestep=timestep,
                         progress_id=progress_id,
                     )
-                    if isinstance(out_pos, dict) and isinstance(out_neg, dict):
-                        vp, dp = out_pos["video"], out_pos.get("depth")
-                        vn, dn = out_neg["video"], out_neg.get("depth")
-                    else:
-                        raise TypeError("Dual-head generation expects dict outputs from model_fn")
 
-                v = vn + float(cfg_scale) * (vp - vn)
-                d = dn + float(cfg_scale) * (dp - dn)
-            else:
-                if not isinstance(out_pos, dict):
-                    raise TypeError("Dual-head generation expects dict output from model_fn")
-                v = out_pos["video"]
-                d = out_pos["depth"]
+                if isinstance(out_pos, dict) and isinstance(out_neg, dict):
+                    vp, dp = out_pos["video"], out_pos.get("depth")
+                    vn, dn = out_neg["video"], out_neg.get("depth")
+                else:
+                    raise TypeError("Dual-head generation expects dict outputs from model_fn")
+
+            v = vn + float(cfg_scale) * (vp - vn)
+            d = dn + float(cfg_scale) * (dp - dn)
+        else:
+            if not isinstance(out_pos, dict):
+                raise TypeError("Dual-head generation expects dict output from model_fn")
+            v = out_pos["video"]
+            d = out_pos["depth"]
 
         inputs_shared["latents"] = pipe.scheduler.step(v, ts, inputs_shared["latents"])
         depth_latents = pipe.scheduler.step(d, ts, depth_latents)
@@ -618,13 +1027,28 @@ def generate_one(
     for unit in getattr(pipe, "post_units", []):
         inputs_shared, _, _ = pipe.unit_runner(unit, pipe, inputs_shared, inputs_posi, inputs_nega)
 
-    pipe.load_models_to_device(["vae"])
+    video_latents = inputs_shared["latents"].to(decode_device)
+    depth_latents_out = depth_latents.to(decode_device)
 
-    video_latents = inputs_shared["latents"]
-    depth_latents_out = depth_latents
+    if getattr(pipe, "vae", None) is None:
+        raise RuntimeError("pipe.vae is None")
 
-    video = pipe.vae.decode(video_latents, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-    depth_vid = pipe.vae.decode(depth_latents_out, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+    pipe.vae.to(device=decode_device, dtype=pipe.torch_dtype).eval()
+
+    video = pipe.vae.decode(
+        video_latents,
+        device=decode_device,
+        tiled=tiled,
+        tile_size=tile_size,
+        tile_stride=tile_stride,
+    )
+    depth_vid = pipe.vae.decode(
+        depth_latents_out,
+        device=decode_device,
+        tiled=tiled,
+        tile_size=tile_size,
+        tile_stride=tile_stride,
+    )
 
     video_u8 = _to_uint8_video(video)
     depth_u8 = _depth_to_uint8(depth_vid)
@@ -634,7 +1058,12 @@ def generate_one(
         depth_f = depth_f[0]
     depth_f = depth_f[0].permute(0, 1, 2).contiguous().numpy()
 
-    pipe.load_models_to_device([])
+    pipe.vae.to("cpu")
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     return video_u8, depth_u8, depth_f
 
@@ -648,6 +1077,7 @@ def main() -> None:
     ap.add_argument("--out_video", type=str, required=True)
     ap.add_argument("--out_depth", type=str, required=True)
 
+    ap.add_argument("--model_id", type=str, required=True)
     ap.add_argument("--model_root", type=str, required=True)
     ap.add_argument("--tokenizer_path", type=str, default=None)
 
@@ -684,6 +1114,10 @@ def main() -> None:
     ap.add_argument("--ttc_scale", type=float, default=1.0)
 
     ap.add_argument("--device", type=str, default=None)
+    ap.add_argument("--device_high", type=str, default=None)
+    ap.add_argument("--device_low", type=str, default=None)
+    ap.add_argument("--decode_device", type=str, default=None)
+
     ap.add_argument("--shard_index", type=int, default=None)
     ap.add_argument("--num_shards", type=int, default=None)
 
@@ -697,14 +1131,19 @@ def main() -> None:
         base_seed = int(args.base_seed) & 0x7FFFFFFF
 
     infer_device, infer_shard, infer_world = _infer_runtime_args_from_env()
-    device = args.device if args.device is not None else infer_device
+    default_device = args.device if args.device is not None else infer_device
+
+    device_high_str = args.device_high if args.device_high is not None else default_device
+    device_low_str = args.device_low if args.device_low is not None else device_high_str
+    decode_device_str = args.decode_device if args.decode_device is not None else device_high_str
+
     shard_index = int(args.shard_index if args.shard_index is not None else infer_shard)
     num_shards = int(args.num_shards if args.num_shards is not None else infer_world)
     num_shards = max(1, num_shards)
 
-    if device.startswith("cuda:"):
+    if device_high_str.startswith("cuda:"):
         try:
-            torch.cuda.set_device(int(device.split(":")[1]))
+            torch.cuda.set_device(int(device_high_str.split(":")[1]))
         except Exception:
             pass
 
@@ -724,11 +1163,13 @@ def main() -> None:
     indexed_rows = [(i, rows_all[i]) for i in range(len(rows_all)) if (i % num_shards) == shard_index]
 
     if os.getenv("RANK", "0") == "0":
-        print(f"Device: {device} | Shard: {shard_index}/{num_shards} | Jobs: {len(indexed_rows)}/{len(rows_all)}")
+        print(f"Devices: high={device_high_str} low={device_low_str} decode={decode_device_str}")
+        print(f"Shard: {shard_index}/{num_shards} | Jobs: {len(indexed_rows)}/{len(rows_all)}")
         print(f"Base seed: {base_seed}")
 
     pipe = build_pipeline(
-        device=device,
+        device_high=device_high_str,
+        device_low=device_low_str,
         model_id=args.model_id,
         model_root=args.model_root,
         tokenizer_path=args.tokenizer_path,
@@ -744,11 +1185,15 @@ def main() -> None:
     tile_size = (int(args.tile_size_h), int(args.tile_size_w))
     tile_stride = (int(args.tile_stride_h), int(args.tile_stride_w))
 
+    device_high = torch.device(device_high_str)
+    device_low = torch.device(device_low_str)
+    decode_device = torch.device(decode_device_str)
+
     for j, (row_idx, (mp4_name, prompt)) in enumerate(indexed_rows, 1):
         src_video = mp4_name if os.path.isabs(mp4_name) else os.path.join(args.init_src_root, mp4_name)
         if not os.path.isfile(src_video):
             if os.getenv("RANK", "0") == "0":
-                print(f"[{device} | {j}/{len(indexed_rows)}] MISSING source: {src_video}")
+                print(f"[{j}/{len(indexed_rows)}] MISSING source: {src_video}")
             continue
 
         ttc_seq = (
@@ -758,15 +1203,13 @@ def main() -> None:
         )
         if ttc_seq is None:
             if os.getenv("RANK", "0") == "0":
-                print(f"[{device} | {j}/{len(indexed_rows)}] MISSING TTC: {mp4_name}")
+                print(f"[{j}/{len(indexed_rows)}] MISSING TTC: {mp4_name}")
             continue
 
         ttc_list = _sample_ttc(ttc_seq, int(args.num_frames), mode=str(args.ttc_sampling))
         ttc_tensor = torch.tensor(ttc_list, dtype=torch.float32).unsqueeze(0)
         if float(args.ttc_scale) != 1.0:
             ttc_tensor = ttc_tensor * float(args.ttc_scale)
-        if device.startswith("cuda"):
-            ttc_tensor = ttc_tensor.to(device=device)
 
         ordinal = ordinals_all[row_idx]
         base_name_for_out = mp4_name if not os.path.isabs(mp4_name) else os.path.basename(mp4_name)
@@ -784,7 +1227,7 @@ def main() -> None:
                 prompt=prompt,
                 negative_prompt=args.negative_prompt,
                 input_image=input_image,
-                ttc_tensor=ttc_tensor,
+                ttc_tensor_cpu=ttc_tensor,
                 seed=row_seed,
                 height=int(args.height),
                 width=int(args.width),
@@ -797,6 +1240,9 @@ def main() -> None:
                 tile_size=tile_size,
                 tile_stride=tile_stride,
                 sigma_shift=float(args.sigma_shift),
+                device_high=device_high,
+                device_low=device_low,
+                decode_device=decode_device,
             )
 
             save_video(video_u8, out_video_path, fps=int(args.fps), quality=int(args.quality))
@@ -809,11 +1255,11 @@ def main() -> None:
             if os.getenv("RANK", "0") == "0":
                 rel_v = os.path.relpath(out_video_path, args.out_video)
                 rel_d = os.path.relpath(out_depth_path, args.out_depth)
-                print(f"[{device} | {j}/{len(indexed_rows)}] DONE: {rel_v} | {rel_d} | seed={row_seed}")
+                print(f"[{j}/{len(indexed_rows)}] DONE: {rel_v} | {rel_d} | seed={row_seed}")
 
         except Exception as e:
             if os.getenv("RANK", "0") == "0":
-                print(f"[{device} | {j}/{len(indexed_rows)}] FAIL: {mp4_name} | {e}")
+                print(f"[{j}/{len(indexed_rows)}] FAIL: {mp4_name} | {e}")
 
     if os.getenv("RANK", "0") == "0":
         print(f"Outputs video: {args.out_video}")

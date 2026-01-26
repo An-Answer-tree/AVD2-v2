@@ -405,6 +405,8 @@ class WanVideoPipeline(BasePipeline):
         tea_cache_model_id: Optional[str] = "",
         # progress_bar
         progress_bar_cmd=tqdm,
+        # Optional outputs
+        return_latents: bool = False,
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
@@ -469,12 +471,16 @@ class WanVideoPipeline(BasePipeline):
         if vace_reference_image is not None:
             inputs_shared["latents"] = inputs_shared["latents"][:, :, 1:]
 
+        latents_final = inputs_shared["latents"].detach()
+
         # Decode
         self.load_models_to_device(['vae'])
-        video = self.vae.decode(inputs_shared["latents"], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+        video = self.vae.decode(latents_final, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
         video = self.vae_output_to_video(video)
         self.load_models_to_device([])
 
+        if return_latents:
+            return {"video": video, "latents": latents_final}
         return video
 
 

@@ -17,18 +17,16 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_HOME="${HF_HOME:-/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/huggingface_cache}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/modelscope_cache}"
 
-GPU_IDS="${GPU_IDS:-0,1,2,3,4,5,6,7}"
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU_IDS}}"
-IFS=',' read -ra _GPU_ARR <<< "${CUDA_VISIBLE_DEVICES}"
-NUM_GPUS="${NUM_GPUS:-${#_GPU_ARR[@]}}"
-NUM_GPUS=$(( NUM_GPUS > 0 ? NUM_GPUS : 1 ))
+export PYTORCH_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:128"
+export CUDA_DEVICE_MAX_CONNECTIONS=1
 
 CSV="${CSV:-/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/video_ttestttc.csv}"
 TTC_JSON="${TTC_JSON:-/baai-cwm-backup/cwm/tong.liu/ttcnew1.json}"
 INIT_SRC_ROOT="${INIT_SRC_ROOT:-/baai-cwm-backup/cwm/tong.liu/newfulldemo/}"
 
-OUT_VIDEO="${OUT_VIDEO:-/baai-cwm-backup/cwm/tong.liu/gen_video_out}"
-OUT_DEPTH="${OUT_DEPTH:-/baai-cwm-backup/cwm/tong.liu/gen_depth_out}"
+OUT_VIDEO="${OUT_VIDEO:-/baai-cwm-backup/cwm/tong.liu/gen_video_out8}"
+OUT_DEPTH="${OUT_DEPTH:-/baai-cwm-backup/cwm/tong.liu/gen_depth_out8}"
 
 MODEL_ID="${MODEL_ID:-Wan-AI/Wan2.2-I2V-A14B}"
 MODEL_ROOT="${MODEL_ROOT:-/baai-cwm-vepfs/cwm/cheng.li/liutong/DiffSynth-Studio/models/Wan-AI/Wan2.2-I2V-A14B}"
@@ -42,7 +40,7 @@ TTC_LOW_CKPT="${TTC_LOW_CKPT:-/baai-cwm-backup/cwm/tong.liu/outputckpt/Wan2.2-I2
 DEPTH_HIGH_CKPT="${DEPTH_HIGH_CKPT:-/baai-cwm-backup/cwm/tong.liu/outputckpt/Wan2.2-I2V-A14B_high_noise_depth_joint49_frozen_lora/epoch-4.safetensors}"
 DEPTH_LOW_CKPT="${DEPTH_LOW_CKPT:-/baai-cwm-backup/cwm/tong.liu/outputckpt/Wan2.2-I2V-A14B_low_noise_depth_joint49_frozen_lora/epoch-4.safetensors}"
 
-WIDTH="${WIDTH:-368}"
+WIDTH="${WIDTH:-384}"
 HEIGHT="${HEIGHT:-320}"
 NUM_FRAMES="${NUM_FRAMES:-49}"
 NUM_STEPS="${NUM_STEPS:-50}"
@@ -59,7 +57,7 @@ TILED="${TILED:-true}"
 LORA_ALPHA="${LORA_ALPHA:-1.0}"
 
 TTC_SAMPLING="${TTC_SAMPLING:-first}"
-TTC_SCALE="${TTC_SCALE:-0.07}"
+TTC_SCALE="${TTC_SCALE:-0.05}"
 
 TOKENIZER_PATH="${TOKENIZER_PATH:-}"
 
@@ -101,6 +99,16 @@ if [[ -n "${TOKENIZER_PATH}" ]]; then
   ARGS+=(--tokenizer_path "${TOKENIZER_PATH}")
 fi
 
-torchrun --standalone --nproc_per_node="${NUM_GPUS}" \
-  "${SCRIPT}" \
-  "${ARGS[@]}"
+NUM_SHARDS=2
+
+CUDA_VISIBLE_DEVICES=0,1 \
+python "${SCRIPT}" "${ARGS[@]}" \
+  --device_high "cuda:0" --device_low "cuda:1" --decode_device "cuda:0" \
+  --shard_index 0 --num_shards ${NUM_SHARDS} &
+
+CUDA_VISIBLE_DEVICES=2,3 \
+python "${SCRIPT}" "${ARGS[@]}" \
+  --device_high "cuda:0" --device_low "cuda:1" --decode_device "cuda:0" \
+  --shard_index 1 --num_shards ${NUM_SHARDS} &
+
+wait
